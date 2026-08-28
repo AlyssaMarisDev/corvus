@@ -4,10 +4,11 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import {
   deleteMemory,
   saveMemory,
+  searchDeletedMemories,
   searchMemories,
   updateMemory,
 } from "./db.js";
-import { MEMORY_EXTRACTOR_PROMPT } from "./prompt.js";
+import { MEMORY_EXTRACTOR_PROMPT, formatMemoryTimestamp } from "./prompt.js";
 import { logger } from "./logger.js";
 
 const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL ?? "gemini-embedding-001";
@@ -80,6 +81,18 @@ export async function retrieveMemories(text) {
   }
 }
 
+// Same never-throws contract as retrieveMemories; used by the deep-think
+// subgraph to search soft-deleted memories.
+export async function retrieveDeletedMemories(text) {
+  try {
+    const queryEmbedding = await embed(text);
+    return await searchDeletedMemories(queryEmbedding);
+  } catch (err) {
+    logger.error({ err }, "deleted memory retrieval failed; continuing without them");
+    return [];
+  }
+}
+
 // Ids are validated against the related set so a hallucinated id can never
 // touch an unrelated memory.
 async function applyOperations({ save, update, delete: remove }, relatedIds) {
@@ -102,27 +115,55 @@ async function applyOperations({ save, update, delete: remove }, relatedIds) {
   }
 }
 
-// Runs after a reply completes. The extractor sees the most similar existing
-// memories (with ids) so it can revise or remove contradicted ones instead of
-// duplicating them.
-export async function extractMemories(userMessage, assistantReply) {
+function messageText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part?.type === "text" ? part.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+function formatTranscript(messages) {
+  return messages
+    .filter((m) => ["human", "ai"].includes(m._getType()))
+    .map((m) => `${m._getType() === "human" ? "User" : "Assistant"}: ${messageText(m)}`)
+    .join("\n");
+}
+
+// Runs after a reply completes with the full conversation. The extractor sees
+// the whole transcript for context, but the related-memory search stays keyed
+// on the latest exchange: that is where new facts appear, and embedding the
+// entire history would dilute the similarity match.
+export async function extractMemories(messages) {
   const start = performance.now();
   try {
+    const reply = messages[messages.length - 1];
+    const userMessage = messages.findLast((m) => m._getType() === "human");
+    if (!userMessage || reply?._getType() !== "ai" || !messageText(reply)) return;
+
     const exchangeEmbedding = await embed(
-      `User: ${userMessage}\nAssistant: ${assistantReply}`
+      `User: ${messageText(userMessage)}\nAssistant: ${messageText(reply)}`
     );
     const related = await searchMemories(exchangeEmbedding);
     // bigserial ids come back from node-pg as strings; normalize to numbers.
     const relatedIds = new Set(related.map((m) => Number(m.id)));
 
     const memoryList = related.length
-      ? related.map((m) => `- [id: ${m.id}] ${m.content}`).join("\n")
+      ? related
+          .map(
+            (m) =>
+              `- [id: ${m.id}] (last updated: ${formatMemoryTimestamp(m.updated_at)}) ${m.content}`
+          )
+          .join("\n")
       : "(none)";
 
     const operations = await extractor.invoke([
       new SystemMessage(MEMORY_EXTRACTOR_PROMPT),
       new HumanMessage(
-        `Existing related memories:\n${memoryList}\n\nLatest exchange:\nUser: ${userMessage}\nAssistant: ${assistantReply}`
+        `Existing related memories:\n${memoryList}\n\nConversation:\n${formatTranscript(messages)}`
       ),
     ]);
 

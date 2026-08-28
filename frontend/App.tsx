@@ -17,6 +17,8 @@ type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  // Thinking-out-loud lines from deep recall; rendered as muted italics.
+  status?: boolean;
 };
 
 const WELCOME: Message = {
@@ -49,6 +51,14 @@ export default function App() {
     try {
       await streamChat(text, conversationId ?? undefined, {
         onConversation: (id) => setConversationId(id),
+        onStatus: (text) => {
+          // Deep-recall status arrives before the reply; keep the thinking
+          // indicator up since tokens are still coming.
+          setMessages((prev) => [
+            ...prev,
+            { id: `status-${Date.now()}`, role: "assistant", content: text, status: true },
+          ]);
+        },
         onToken: (token) => {
           if (!replyStarted) {
             replyStarted = true;
@@ -107,7 +117,9 @@ export default function App() {
                 item.role === "user" ? styles.userBubble : styles.assistantBubble,
               ]}
             >
-              <Text style={styles.bubbleText}>{item.content}</Text>
+              <Text style={item.status ? styles.thinkingText : styles.bubbleText}>
+                {item.content}
+              </Text>
             </View>
           )}
           ListFooterComponent={

@@ -117,9 +117,27 @@ export async function searchMemories(
   { limit = 5, maxDistance = MEMORY_DISTANCE_CUTOFF } = {}
 ) {
   const { rows } = await query(
-    `SELECT id, content, embedding <=> $1 AS distance
+    `SELECT id, content, updated_at, embedding <=> $1 AS distance
      FROM memories
      WHERE deleted_at IS NULL
+       AND embedding <=> $1 < $2
+     ORDER BY distance
+     LIMIT $3;`,
+    [toVectorLiteral(queryEmbedding), maxDistance, limit]
+  );
+  return rows;
+}
+
+// Deleted memories are soft-deleted rows; the deep-think subgraph searches
+// them to answer questions about facts that changed or were forgotten.
+export async function searchDeletedMemories(
+  queryEmbedding,
+  { limit = 5, maxDistance = MEMORY_DISTANCE_CUTOFF } = {}
+) {
+  const { rows } = await query(
+    `SELECT id, content, updated_at, deleted_at, embedding <=> $1 AS distance
+     FROM memories
+     WHERE deleted_at IS NOT NULL
        AND embedding <=> $1 < $2
      ORDER BY distance
      LIMIT $3;`,

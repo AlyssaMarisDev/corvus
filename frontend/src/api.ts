@@ -7,6 +7,7 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:4200";
 export type ChatStreamHandlers = {
   onConversation: (conversationId: string) => void;
   onToken: (text: string) => void;
+  onStatus?: (text: string) => void;
 };
 
 // Streams a reply from POST /chat (SSE). expo/fetch is required here because
@@ -48,6 +49,8 @@ export async function streamChat(
       handlers.onConversation(data.conversationId);
     } else if (event === "token") {
       handlers.onToken(data.text);
+    } else if (event === "status") {
+      handlers.onStatus?.(data.text);
     } else if (event === "error") {
       throw new Error(data.error ?? "stream error");
     }

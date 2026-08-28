@@ -51,7 +51,19 @@ app.post("/chat", async (req, res) => {
     );
 
     const history = await loadHistory(conversationId);
-    const messages = history.map((m) =>
+    // Deep-think turns persist a status line before the reply, producing
+    // consecutive assistant rows; merge same-role runs so Gemini sees
+    // strictly alternating roles.
+    const mergedHistory = [];
+    for (const m of history) {
+      const last = mergedHistory[mergedHistory.length - 1];
+      if (last && last.role === m.role) {
+        last.content += `\n${m.content}`;
+      } else {
+        mergedHistory.push({ ...m });
+      }
+    }
+    const messages = mergedHistory.map((m) =>
       m.role === "user" ? new HumanMessage(m.content) : new AIMessage(m.content)
     );
     messages.push(new HumanMessage(message));
@@ -76,13 +88,19 @@ app.post("/chat", async (req, res) => {
 
     const start = performance.now();
     let reply = "";
-    for await (const token of streamCorvus(messages, conversationId)) {
+    let statusText = "";
+    for await (const event of streamCorvus(messages, conversationId)) {
       if (!clientConnected) {
         req.log.info({ conversationId }, "chat stream abandoned by client");
         return res.end();
       }
-      reply += token;
-      sendEvent("token", { text: token });
+      if (event.type === "status") {
+        statusText = event.text;
+        sendEvent("status", { text: event.text });
+      } else {
+        reply += event.text;
+        sendEvent("token", { text: event.text });
+      }
     }
 
     req.log.info(
@@ -96,6 +114,9 @@ app.post("/chat", async (req, res) => {
     );
 
     await saveMessage(conversationId, "user", message);
+    if (statusText) {
+      await saveMessage(conversationId, "assistant", statusText);
+    }
     await saveMessage(conversationId, "assistant", reply);
 
     sendEvent("done", { conversationId });
