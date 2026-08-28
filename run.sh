@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Starting backend (db container + Ollama check + API)..."
+echo "Starting backend (db container + API)..."
 (cd "$ROOT_DIR/backend" && ./run.sh > backend.log 2>&1 &)
 
 echo "Starting frontend (Expo dev server)..."
@@ -13,5 +13,5 @@ echo "Starting frontend (Expo dev server)..."
 
 echo ""
 echo "Corvus is starting up."
-echo "  Backend:  http://localhost:4000  (tail -f backend/backend.log)"
+echo "  Backend:  http://localhost:4200  (tail -f backend/backend.log)"
 echo "  Frontend: Expo dev server        (tail -f frontend/frontend.log)"

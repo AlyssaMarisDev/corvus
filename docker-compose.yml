@@ -1,0 +1,24 @@
+services:
+  db:
+    # Same image run.sh uses; includes the pgvector extension
+    image: pgvector/pgvector:pg16
+    container_name: corvus-db
+    environment:
+      POSTGRES_DB: corvus
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: corvus
+    ports:
+      # Postgres listens on 5432 inside the container; host port is 4202
+      - "4202:5432"
+    volumes:
+      - corvus-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d corvus"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  corvus-db-data:

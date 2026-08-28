@@ -10,8 +10,8 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
-import { sendChat } from "./src/api";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { streamChat } from "./src/api";
 
 type Message = {
   id: string;
@@ -43,13 +43,32 @@ export default function App() {
     setInput("");
     setIsThinking(true);
 
+    const replyId = `corvus-${Date.now()}`;
+    let replyStarted = false;
+
     try {
-      const res = await sendChat(text, conversationId ?? undefined);
-      setConversationId(res.conversationId);
-      setMessages((prev) => [
-        ...prev,
-        { id: `corvus-${Date.now()}`, role: "assistant", content: res.reply },
-      ]);
+      await streamChat(text, conversationId ?? undefined, {
+        onConversation: (id) => setConversationId(id),
+        onToken: (token) => {
+          if (!replyStarted) {
+            replyStarted = true;
+            setIsThinking(false);
+            setMessages((prev) => [
+              ...prev,
+              { id: replyId, role: "assistant", content: token },
+            ]);
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === replyId ? { ...m, content: m.content + token } : m
+              )
+            );
+          }
+        },
+      });
+      if (!replyStarted) {
+        throw new Error("stream ended without a reply");
+      }
     } catch {
       setMessages((prev) => [
         ...prev,
@@ -67,60 +86,62 @@ export default function App() {
   const canSend = input.trim().length > 0 && !isThinking;
 
   return (
-    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
-      <StatusBar style="light" />
-      <View style={styles.header}>
-        <Text style={styles.title}>Corvus</Text>
-        <Text style={styles.subtitle}>personal ai assistant</Text>
-      </View>
-
-      <FlatList
-        ref={listRef}
-        data={messages}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.list}
-        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
-        renderItem={({ item }) => (
-          <View
-            style={[
-              styles.bubble,
-              item.role === "user" ? styles.userBubble : styles.assistantBubble,
-            ]}
-          >
-            <Text style={styles.bubbleText}>{item.content}</Text>
-          </View>
-        )}
-        ListFooterComponent={
-          isThinking ? (
-            <View style={[styles.bubble, styles.assistantBubble]}>
-              <Text style={styles.thinkingText}>Corvus is thinking…</Text>
-            </View>
-          ) : null
-        }
-      />
-
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined}>
-        <View style={styles.inputRow}>
-          <TextInput
-            style={styles.input}
-            value={input}
-            onChangeText={setInput}
-            placeholder="Message Corvus…"
-            placeholderTextColor="#6b7280"
-            multiline
-            editable={!isThinking}
-            onSubmitEditing={send}
-          />
-          <TouchableOpacity
-            style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
-            onPress={send}
-            disabled={!canSend}
-          >
-            <Text style={styles.sendButtonText}>Send</Text>
-          </TouchableOpacity>
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+        <StatusBar style="light" />
+        <View style={styles.header}>
+          <Text style={styles.title}>Corvus</Text>
+          <Text style={styles.subtitle}>personal ai assistant</Text>
         </View>
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.list}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+          renderItem={({ item }) => (
+            <View
+              style={[
+                styles.bubble,
+                item.role === "user" ? styles.userBubble : styles.assistantBubble,
+              ]}
+            >
+              <Text style={styles.bubbleText}>{item.content}</Text>
+            </View>
+          )}
+          ListFooterComponent={
+            isThinking ? (
+              <View style={[styles.bubble, styles.assistantBubble]}>
+                <Text style={styles.thinkingText}>Corvus is thinking…</Text>
+              </View>
+            ) : null
+          }
+        />
+
+        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined}>
+          <View style={styles.inputRow}>
+            <TextInput
+              style={styles.input}
+              value={input}
+              onChangeText={setInput}
+              placeholder="Message Corvus…"
+              placeholderTextColor="#6b7280"
+              multiline
+              editable={!isThinking}
+              onSubmitEditing={send}
+            />
+            <TouchableOpacity
+              style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
+              onPress={send}
+              disabled={!canSend}
+            >
+              <Text style={styles.sendButtonText}>Send</Text>
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 

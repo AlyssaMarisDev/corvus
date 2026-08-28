@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import pinoHttp from "pino-http";
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import {
   conversationExists,
@@ -9,13 +10,15 @@ import {
   loadHistory,
   saveMessage,
 } from "./db.js";
-import { runCorvus } from "./agent.js";
+import { streamCorvus } from "./agent.js";
+import { logger } from "./logger.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(pinoHttp({ logger }));
 
-const PORT = process.env.PORT ?? 4000;
+const PORT = process.env.PORT;
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", assistant: "Corvus" });
@@ -27,16 +30,25 @@ app.post("/chat", async (req, res) => {
     let { conversationId } = req.body ?? {};
 
     if (!message || typeof message !== "string") {
+      req.log.warn("chat rejected: missing or invalid message");
       return res.status(400).json({ error: "message is required" });
     }
 
     if (conversationId) {
       if (!(await conversationExists(conversationId))) {
+        req.log.warn({ conversationId }, "chat rejected: conversation not found");
         return res.status(404).json({ error: "conversation not found" });
       }
     } else {
       conversationId = await createConversation();
+      req.log.info({ conversationId }, "conversation created");
     }
+
+    // Log lengths rather than content so private conversations stay out of logs.
+    req.log.info(
+      { conversationId, messageLength: message.length },
+      "chat message received"
+    );
 
     const history = await loadHistory(conversationId);
     const messages = history.map((m) =>
@@ -44,15 +56,63 @@ app.post("/chat", async (req, res) => {
     );
     messages.push(new HumanMessage(message));
 
-    const reply = await runCorvus(messages);
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    let clientConnected = true;
+    req.on("close", () => {
+      clientConnected = false;
+    });
+
+    // Payloads are JSON-encoded so token text can safely contain newlines.
+    const sendEvent = (event, data) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    sendEvent("meta", { conversationId });
+
+    const start = performance.now();
+    let reply = "";
+    for await (const token of streamCorvus(messages, conversationId)) {
+      if (!clientConnected) {
+        req.log.info({ conversationId }, "chat stream abandoned by client");
+        return res.end();
+      }
+      reply += token;
+      sendEvent("token", { text: token });
+    }
+
+    req.log.info(
+      {
+        conversationId,
+        historyLength: history.length,
+        replyLength: reply.length,
+        durationMs: Math.round(performance.now() - start),
+      },
+      "chat reply generated"
+    );
 
     await saveMessage(conversationId, "user", message);
     await saveMessage(conversationId, "assistant", reply);
 
-    res.json({ reply, conversationId });
+    sendEvent("done", { conversationId });
+    res.end();
   } catch (err) {
-    console.error("chat error", err);
-    res.status(500).json({ error: "failed to get a response from Corvus" });
+    req.log.error({ err }, "chat error");
+    if (res.headersSent) {
+      // Headers already went out as SSE, so report failures as an event.
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          error: "failed to get a response from Corvus",
+        })}\n\n`
+      );
+      res.end();
+    } else {
+      res.status(500).json({ error: "failed to get a response from Corvus" });
+    }
   }
 });
 
@@ -65,7 +125,7 @@ app.get("/history/:conversationId", async (req, res) => {
     const messages = await loadHistory(conversationId);
     res.json({ conversationId, messages });
   } catch (err) {
-    console.error("history error", err);
+    req.log.error({ err }, "history error");
     res.status(500).json({ error: "failed to load history" });
   }
 });
@@ -73,10 +133,10 @@ app.get("/history/:conversationId", async (req, res) => {
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Corvus backend listening on http://localhost:${PORT}`);
+      logger.info({ port: PORT }, "Corvus backend listening");
     });
   })
   .catch((err) => {
-    console.error("Failed to initialize database", err);
+    logger.fatal({ err }, "failed to initialize database");
     process.exit(1);
   });
