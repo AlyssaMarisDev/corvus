@@ -9,8 +9,11 @@ import {
   initDb,
   loadHistory,
   saveMessage,
+  saveMessageEmbedding,
 } from "./db.js";
 import { streamCorvus } from "./agent.js";
+import { embed } from "./memory.js";
+import { startThoughtLoop } from "./brain.js";
 import { logger } from "./logger.js";
 
 const app = express();
@@ -113,11 +116,24 @@ app.post("/chat", async (req, res) => {
       "chat reply generated"
     );
 
-    await saveMessage(conversationId, "user", message);
+    const userMessageId = await saveMessage(conversationId, "user", message);
     if (statusText) {
+      // Saved for history but never embedded: transient thinking-out-loud is
+      // noise for past-conversation search.
       await saveMessage(conversationId, "assistant", statusText);
     }
-    await saveMessage(conversationId, "assistant", reply);
+    const replyId = await saveMessage(conversationId, "assistant", reply);
+
+    // Embed in the background so the done event is not delayed; a failure
+    // leaves embedding NULL, which the backfill script repairs on its next run.
+    for (const [id, text] of [
+      [userMessageId, message],
+      [replyId, reply],
+    ]) {
+      void embed(text)
+        .then((e) => saveMessageEmbedding(id, e))
+        .catch((err) => logger.error({ err }, "message embedding failed"));
+    }
 
     sendEvent("done", { conversationId });
     res.end();
@@ -156,6 +172,7 @@ initDb()
     app.listen(PORT, () => {
       logger.info({ port: PORT }, "Corvus backend listening");
     });
+    startThoughtLoop();
   })
   .catch((err) => {
     logger.fatal({ err }, "failed to initialize database");

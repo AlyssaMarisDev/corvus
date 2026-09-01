@@ -10,7 +10,12 @@ import { tool } from "@langchain/core/tools";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { z } from "zod";
-import { retrieveDeletedMemories, retrieveMemories } from "./memory.js";
+import {
+  retrieveDeletedCoreMemories,
+  retrieveDeletedMemories,
+  retrieveMemories,
+  retrievePastConversations,
+} from "./memory.js";
 import { PLANNER_PROMPT, formatMemoryTimestamp } from "./prompt.js";
 import { logger } from "./logger.js";
 
@@ -27,14 +32,34 @@ const model = new ChatGoogleGenerativeAI({
 function formatActive(memories) {
   if (!memories.length) return "No active memories found.";
   return memories
-    .map((m) => `- ${m.content} (last updated: ${formatMemoryTimestamp(m.updated_at)})`)
+    .map((m) => `- [active] ${m.content} (last updated: ${formatMemoryTimestamp(m.updated_at)})`)
     .join("\n");
 }
 
-function formatDeleted(memories) {
-  if (!memories.length) return "No deleted memories found.";
-  return memories
-    .map((m) => `- ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)})`)
+function formatDeleted(memories, coreMemories) {
+  const lines = [
+    ...memories.map(
+      (m) => `- [deleted] ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)})`
+    ),
+    ...coreMemories.map(
+      (m) =>
+        `- [deleted] ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)}) [core profile fact]`
+    ),
+  ];
+  if (!lines.length) return "No deleted memories found.";
+  return lines.join("\n");
+}
+
+// Long messages are truncated so a single hit cannot flood the planner's
+// context; the conversation id prefix lets the planner tell sources apart.
+function formatConversations(messages) {
+  if (!messages.length) return "No past conversation messages found.";
+  return messages
+    .map((m) => {
+      const content =
+        m.content.length > 500 ? `${m.content.slice(0, 500)}…` : m.content;
+      return `- [${m.role}] ${formatMemoryTimestamp(m.created_at)} (conversation ${String(m.conversation_id).slice(0, 8)}): ${content}`;
+    })
     .join("\n");
 }
 
@@ -51,18 +76,43 @@ const fetchMemories = tool(
 );
 
 const fetchDeletedMemories = tool(
-  async ({ query }) => formatDeleted(await retrieveDeletedMemories(query)),
+  async ({ query }) =>
+    formatDeleted(
+      await retrieveDeletedMemories(query),
+      await retrieveDeletedCoreMemories(query)
+    ),
   {
     name: "fetch_deleted_memories",
     description:
-      "Search the user's deleted (outdated or contradicted) long-term memories by semantic similarity. Useful when the directive concerns something that may have changed.",
+      "Search the user's deleted (outdated or contradicted) long-term memories by semantic similarity, including deleted core profile facts. Useful when the directive concerns something that may have changed.",
     schema: z.object({
       query: z.string().describe("short search phrase to match deleted memories against"),
     }),
   }
 );
 
-const tools = [fetchMemories, fetchDeletedMemories];
+// config.configurable.conversationId is set by the deepThink node so the
+// current conversation (already in the model's context) is excluded.
+const fetchPastConversations = tool(
+  async ({ query }, config) =>
+    formatConversations(
+      await retrievePastConversations(query, {
+        excludeConversationId: config?.configurable?.conversationId,
+      })
+    ),
+  {
+    name: "fetch_past_conversations",
+    description:
+      "Search messages from the user's past conversations (excluding the current one) by semantic similarity to a short query phrase. Useful when the directive concerns something said earlier that may not be captured in long-term memories.",
+    schema: z.object({
+      query: z
+        .string()
+        .describe("short search phrase to match past conversation messages against"),
+    }),
+  }
+);
+
+const tools = [fetchMemories, fetchDeletedMemories, fetchPastConversations];
 
 const DeepThinkAnnotation = Annotation.Root({
   ...MessagesAnnotation.spec,

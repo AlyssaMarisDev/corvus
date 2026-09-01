@@ -20,5 +20,21 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  redis:
+    image: redis:8-alpine
+    container_name: corvus-redis
+    ports:
+      # 6379 is taken by another project's container on this machine
+      - "4203:6379"
+    # Working memory for the thought loop is ephemeral by design: no volume,
+    # and every thought key carries its own TTL.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
 volumes:
   corvus-db-data:

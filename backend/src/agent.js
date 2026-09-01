@@ -11,7 +11,7 @@ import { dispatchCustomEvent } from "@langchain/core/callbacks/dispatch";
 import { z } from "zod";
 import { buildSystemPrompt } from "./prompt.js";
 import { deepThinkGraph } from "./deepthink.js";
-import { extractMemories, retrieveMemories } from "./memory.js";
+import { extractMemories, retrieveCoreMemories, retrieveMemories } from "./memory.js";
 import { logger } from "./logger.js";
 
 const model = new ChatGoogleGenerativeAI({
@@ -26,6 +26,10 @@ const model = new ChatGoogleGenerativeAI({
 const CorvusAnnotation = Annotation.Root({
   ...MessagesAnnotation.spec,
   memories: Annotation({
+    reducer: (_current, next) => next,
+    default: () => [],
+  }),
+  coreMemories: Annotation({
     reducer: (_current, next) => next,
     default: () => [],
   }),
@@ -46,7 +50,7 @@ const CorvusAnnotation = Annotation.Root({
 const thinkDeeper = {
   name: "think_deeper",
   description:
-    "Deep-recall search over the user's long-term memories, including deleted ones. Call only when the conversation and the provided memories do not suffice to answer.",
+    "Deep-recall search over the user's long-term memories, including deleted ones. Findings tag each memory as [active] or [deleted] (outdated or contradicted). Call only when the conversation and the provided memories do not suffice to answer.",
   schema: z.object({
     directive: z
       .string()
@@ -66,7 +70,7 @@ async function callModel(state) {
     // no tools are offered on the second call.
     const activeModel = state.deepThinkUsed ? model : model.bindTools([thinkDeeper]);
     const chunks = await activeModel.stream([
-      new SystemMessage(buildSystemPrompt(state.memories)),
+      new SystemMessage(buildSystemPrompt(state.memories, state.coreMemories)),
       ...state.messages,
     ]);
     let response;
@@ -81,6 +85,7 @@ async function callModel(state) {
         model: process.env.GEMINI_MODEL,
         inputMessages: state.messages.length,
         memories: state.memories.length,
+        coreMemories: state.coreMemories.length,
         durationMs: Math.round(performance.now() - start),
       },
       "llm call completed"
@@ -109,16 +114,24 @@ function chunkText(content) {
   return "";
 }
 
-// Populates state.memories for the corvus node. Retrieval failures degrade to
-// no memories inside retrieveMemories, so this node never fails the run.
+// Populates state.memories and state.coreMemories for the corvus node.
+// Retrieval failures degrade to no memories inside retrieveMemories and
+// retrieveCoreMemories, so this node never fails the run.
 async function retrieve(state) {
   const lastMessage = state.messages[state.messages.length - 1];
-  const memories = await retrieveMemories(chunkText(lastMessage?.content));
+  const [memories, coreMemories] = await Promise.all([
+    retrieveMemories(chunkText(lastMessage?.content)),
+    retrieveCoreMemories(),
+  ]);
   logger.info(
-    { conversationId: state.conversationId, memoryCount: memories.length },
+    {
+      conversationId: state.conversationId,
+      memoryCount: memories.length,
+      coreMemoryCount: coreMemories.length,
+    },
     "memories retrieved"
   );
-  return { memories };
+  return { memories, coreMemories };
 }
 
 // Runs the deep-recall subgraph for the think_deeper tool call and answers
@@ -133,10 +146,15 @@ async function deepThink(state) {
   logger.info({ conversationId: state.conversationId, directive }, "deep-think subgraph invoked");
   await dispatchCustomEvent("corvus_status", { text: status });
 
-  const result = await deepThinkGraph.invoke({
-    directive,
-    messages: [new HumanMessage(directive)],
-  });
+  // conversationId travels via configurable so the fetch_past_conversations
+  // tool can exclude the current conversation from its search.
+  const result = await deepThinkGraph.invoke(
+    {
+      directive,
+      messages: [new HumanMessage(directive)],
+    },
+    { configurable: { conversationId: state.conversationId } }
+  );
   const summary =
     chunkText(result.messages[result.messages.length - 1]?.content) ||
     "Nothing relevant was found in long-term memory.";
