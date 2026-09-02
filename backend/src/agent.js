@@ -11,8 +11,14 @@ import { dispatchCustomEvent } from "@langchain/core/callbacks/dispatch";
 import { z } from "zod";
 import { buildSystemPrompt } from "./prompt.js";
 import { deepThinkGraph } from "./deepthink.js";
+import { getWorkingMemory, synthesizeInteraction } from "./brain.js";
 import { extractMemories, retrieveCoreMemories, retrieveMemories } from "./memory.js";
 import { logger } from "./logger.js";
+
+// Deep recall is disabled while the working-memory integration is exercised
+// in isolation; flip to true to re-enable the think_deeper tool and the
+// deep-think subgraph.
+const DEEP_THINK_ENABLED = false;
 
 const model = new ChatGoogleGenerativeAI({
   model: process.env.GEMINI_MODEL,
@@ -30,6 +36,12 @@ const CorvusAnnotation = Annotation.Root({
     default: () => [],
   }),
   coreMemories: Annotation({
+    reducer: (_current, next) => next,
+    default: () => [],
+  }),
+  // The thought loop's Redis working memory, injected into the system prompt
+  // alongside the retrieved memories.
+  workingMemory: Annotation({
     reducer: (_current, next) => next,
     default: () => [],
   }),
@@ -68,9 +80,17 @@ async function callModel(state) {
   try {
     // After the subgraph has run, the model must answer from the findings, so
     // no tools are offered on the second call.
-    const activeModel = state.deepThinkUsed ? model : model.bindTools([thinkDeeper]);
+    const activeModel =
+      DEEP_THINK_ENABLED && !state.deepThinkUsed ? model.bindTools([thinkDeeper]) : model;
     const chunks = await activeModel.stream([
-      new SystemMessage(buildSystemPrompt(state.memories, state.coreMemories)),
+      new SystemMessage(
+        buildSystemPrompt({
+          memories: state.memories,
+          coreMemories: state.coreMemories,
+          workingMemory: state.workingMemory,
+          deepThinkEnabled: DEEP_THINK_ENABLED,
+        })
+      ),
       ...state.messages,
     ]);
     let response;
@@ -86,6 +106,7 @@ async function callModel(state) {
         inputMessages: state.messages.length,
         memories: state.memories.length,
         coreMemories: state.coreMemories.length,
+        workingMemory: state.workingMemory.length,
         durationMs: Math.round(performance.now() - start),
       },
       "llm call completed"
@@ -114,24 +135,27 @@ function chunkText(content) {
   return "";
 }
 
-// Populates state.memories and state.coreMemories for the corvus node.
-// Retrieval failures degrade to no memories inside retrieveMemories and
-// retrieveCoreMemories, so this node never fails the run.
+// Populates state.memories, state.coreMemories, and state.workingMemory for
+// the corvus node. Retrieval failures degrade to empty lists inside
+// retrieveMemories, retrieveCoreMemories, and getWorkingMemory, so this node
+// never fails the run.
 async function retrieve(state) {
   const lastMessage = state.messages[state.messages.length - 1];
-  const [memories, coreMemories] = await Promise.all([
+  const [memories, coreMemories, workingMemory] = await Promise.all([
     retrieveMemories(chunkText(lastMessage?.content)),
     retrieveCoreMemories(),
+    getWorkingMemory(),
   ]);
   logger.info(
     {
       conversationId: state.conversationId,
       memoryCount: memories.length,
       coreMemoryCount: coreMemories.length,
+      workingMemoryCount: workingMemory.length,
     },
-    "memories retrieved"
+    "context retrieved"
   );
-  return { memories, coreMemories };
+  return { memories, coreMemories, workingMemory };
 }
 
 // Runs the deep-recall subgraph for the think_deeper tool call and answers
@@ -175,7 +199,7 @@ async function deepThink(state) {
 }
 
 function routeAfterCorvus(state) {
-  if (state.deepThinkUsed) return "extract";
+  if (!DEEP_THINK_ENABLED || state.deepThinkUsed) return "extract";
   const lastMessage = state.messages[state.messages.length - 1];
   const wantsDeepThink = lastMessage?.tool_calls?.some(
     (tc) => tc.name === "think_deeper"
@@ -183,11 +207,17 @@ function routeAfterCorvus(state) {
   return wantsDeepThink ? "deepThink" : "extract";
 }
 
-// Revises long-term memory from the completed exchange. The extractor sees
-// the full conversation for context. extractMemories logs and swallows its
-// own errors, so this node never fails the run.
+// Revises long-term memory from the completed exchange and synthesizes it
+// into working memory as an interaction anchor. Both steps log and swallow
+// their own errors, so this node never fails the run.
 async function extract(state) {
-  await extractMemories(state.messages);
+  const reply = state.messages[state.messages.length - 1];
+  const userMessage = state.messages.findLast((m) => m._getType() === "human");
+  const work = [extractMemories(state.messages)];
+  if (userMessage && reply?._getType() === "ai" && chunkText(reply.content)) {
+    work.push(synthesizeInteraction(chunkText(userMessage.content), chunkText(reply.content)));
+  }
+  await Promise.all(work);
 }
 
 // Only the corvus node calls the chat model for the reply; retrieve/extract

@@ -13,7 +13,7 @@ import {
 } from "./db.js";
 import { streamCorvus } from "./agent.js";
 import { embed } from "./memory.js";
-import { startThoughtLoop } from "./brain.js";
+import { notifyChatRequest, startThoughtLoop } from "./brain.js";
 import { logger } from "./logger.js";
 
 const app = express();
@@ -52,6 +52,8 @@ app.post("/chat", async (req, res) => {
       { conversationId, messageLength: message.length },
       "chat message received"
     );
+    // A validated chat message wakes the brain into active mode.
+    notifyChatRequest();
 
     const history = await loadHistory(conversationId);
     // Deep-think turns persist a status line before the reply, producing

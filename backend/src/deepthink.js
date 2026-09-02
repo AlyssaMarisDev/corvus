@@ -11,7 +11,6 @@ import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { z } from "zod";
 import {
-  retrieveDeletedCoreMemories,
   retrieveDeletedMemories,
   retrieveMemories,
   retrievePastConversations,
@@ -36,16 +35,11 @@ function formatActive(memories) {
     .join("\n");
 }
 
-function formatDeleted(memories, coreMemories) {
-  const lines = [
-    ...memories.map(
-      (m) => `- [deleted] ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)})`
-    ),
-    ...coreMemories.map(
-      (m) =>
-        `- [deleted] ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)}) [core profile fact]`
-    ),
-  ];
+function formatDeleted(memories) {
+  const lines = memories.map(
+    (m) =>
+      `- [deleted] ${m.content} (deleted: ${formatMemoryTimestamp(m.deleted_at)})${m.tag === "core" ? " [core profile fact]" : ""}`
+  );
   if (!lines.length) return "No deleted memories found.";
   return lines.join("\n");
 }
@@ -76,11 +70,7 @@ const fetchMemories = tool(
 );
 
 const fetchDeletedMemories = tool(
-  async ({ query }) =>
-    formatDeleted(
-      await retrieveDeletedMemories(query),
-      await retrieveDeletedCoreMemories(query)
-    ),
+  async ({ query }) => formatDeleted(await retrieveDeletedMemories(query)),
   {
     name: "fetch_deleted_memories",
     description:

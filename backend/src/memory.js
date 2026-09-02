@@ -2,16 +2,12 @@ import { z } from "zod";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import {
-  deleteCoreMemory,
   deleteMemory,
-  getCoreMemories,
-  saveCoreMemory,
+  getMemoriesByTag,
   saveMemory,
-  searchDeletedCoreMemories,
   searchDeletedMemories,
   searchMemories,
   searchMessages,
-  updateCoreMemory,
   updateMemory,
 } from "./db.js";
 import { MEMORY_EXTRACTOR_PROMPT, formatMemoryTimestamp } from "./prompt.js";
@@ -105,11 +101,13 @@ export async function retrieveMemories(text) {
 }
 
 // Same never-throws contract as retrieveMemories; used by the deep-think
-// subgraph to search soft-deleted memories.
+// subgraph to search soft-deleted memories. Both tiers share one table, so a
+// single search returns regular and core rows together (tag included for
+// labeling); the wider limit keeps parity with the old per-tier searches.
 export async function retrieveDeletedMemories(text) {
   try {
     const queryEmbedding = await embed(text);
-    return await searchDeletedMemories(queryEmbedding);
+    return await searchDeletedMemories(queryEmbedding, { limit: 8 });
   } catch (err) {
     logger.error({ err }, "deleted memory retrieval failed; continuing without them");
     return [];
@@ -120,20 +118,9 @@ export async function retrieveDeletedMemories(text) {
 // every active row rather than similarity-searching.
 export async function retrieveCoreMemories() {
   try {
-    return await getCoreMemories();
+    return await getMemoriesByTag("core");
   } catch (err) {
     logger.error({ err }, "core memory retrieval failed; continuing without them");
-    return [];
-  }
-}
-
-// Used by the deep-think subgraph to search soft-deleted core memories.
-export async function retrieveDeletedCoreMemories(text) {
-  try {
-    const queryEmbedding = await embed(text);
-    return await searchDeletedCoreMemories(queryEmbedding);
-  } catch (err) {
-    logger.error({ err }, "deleted core memory retrieval failed; continuing without them");
     return [];
   }
 }
@@ -175,18 +162,18 @@ async function applyOperations(
     }
   }
   for (const { content } of saveCore) {
-    await saveCoreMemory(content, await embed(content));
+    await saveMemory(content, await embed(content), "core");
   }
   for (const { id, content } of updateCore) {
     if (coreIds.has(id)) {
-      await updateCoreMemory(id, content, await embed(content));
+      await updateMemory(id, content, await embed(content));
     } else {
       logger.warn({ id }, "skipping update for unknown core memory id");
     }
   }
   for (const { id } of deleteCore) {
     if (coreIds.has(id)) {
-      await deleteCoreMemory(id);
+      await deleteMemory(id);
     } else {
       logger.warn({ id }, "skipping delete for unknown core memory id");
     }
@@ -207,7 +194,7 @@ function messageText(message) {
 function formatTranscript(messages) {
   return messages
     .filter((m) => ["human", "ai"].includes(m._getType()))
-    .map((m) => `${m._getType() === "human" ? "User" : "Assistant"}: ${messageText(m)}`)
+    .map((m) => `${m._getType() === "human" ? "User" : "Butler"}: ${messageText(m)}`)
     .join("\n");
 }
 
@@ -223,11 +210,11 @@ export async function extractMemories(messages) {
     if (!userMessage || reply?._getType() !== "ai" || !messageText(reply)) return;
 
     const exchangeEmbedding = await embed(
-      `User: ${messageText(userMessage)}\nAssistant: ${messageText(reply)}`
+      `User: ${messageText(userMessage)}\nButler: ${messageText(reply)}`
     );
     const [related, coreMemories] = await Promise.all([
       searchMemories(exchangeEmbedding),
-      getCoreMemories(),
+      getMemoriesByTag("core"),
     ]);
     // bigserial ids come back from node-pg as strings; normalize to numbers.
     const relatedIds = new Set(related.map((m) => Number(m.id)));
