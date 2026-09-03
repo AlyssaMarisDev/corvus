@@ -5,17 +5,29 @@ import { fetch } from "expo/fetch";
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:4200";
 
 export type ChatStreamHandlers = {
-  onConversation: (conversationId: string) => void;
   onToken: (text: string) => void;
   onStatus?: (text: string) => void;
 };
+
+export type HistoryMessage = { role: "user" | "assistant"; content: string };
+
+// Fetches the single conversation's full history on app launch, so
+// proactive messages sent while the app was closed are not missed.
+export async function fetchHistory(): Promise<{
+  messages: HistoryMessage[];
+}> {
+  const res = await fetch(`${API_URL}/history`);
+  if (!res.ok) {
+    throw new Error(`history request failed with status ${res.status}`);
+  }
+  return res.json();
+}
 
 // Streams a reply from POST /chat (SSE). expo/fetch is required here because
 // React Native's built-in fetch does not support reading response bodies as
 // streams. Throws if the request fails or the server reports a stream error.
 export async function streamChat(
   message: string,
-  conversationId: string | undefined,
   handlers: ChatStreamHandlers
 ): Promise<void> {
   const res = await fetch(`${API_URL}/chat`, {
@@ -24,7 +36,7 @@ export async function streamChat(
       "Content-Type": "application/json",
       Accept: "text/event-stream",
     },
-    body: JSON.stringify({ message, conversationId }),
+    body: JSON.stringify({ message }),
   });
 
   if (!res.ok || !res.body) {
@@ -45,9 +57,7 @@ export async function streamChat(
     if (dataLines.length === 0) return;
 
     const data = JSON.parse(dataLines.join("\n"));
-    if (event === "meta") {
-      handlers.onConversation(data.conversationId);
-    } else if (event === "token") {
+    if (event === "token") {
       handlers.onToken(data.text);
     } else if (event === "status") {
       handlers.onStatus?.(data.text);

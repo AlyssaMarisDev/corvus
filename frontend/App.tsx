@@ -1,5 +1,5 @@
 import { StatusBar } from "expo-status-bar";
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
   KeyboardAvoidingView,
@@ -11,7 +11,8 @@ import {
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { streamChat } from "./src/api";
+import { fetchHistory, streamChat } from "./src/api";
+import { subscribeToEvents } from "./src/events";
 
 type Message = {
   id: string;
@@ -30,9 +31,68 @@ const WELCOME: Message = {
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([WELCOME]);
   const [input, setInput] = useState("");
-  const [conversationId, setConversationId] = useState<string | null>(null);
   const [isThinking, setIsThinking] = useState(false);
   const listRef = useRef<FlatList<Message>>(null);
+
+  // Load the conversation's history on launch, so proactive messages
+  // sent while the app was closed show up in the timeline.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const history = await fetchHistory();
+        if (cancelled || !history.messages.length) return;
+        setMessages(
+          history.messages.map((m, i) => ({
+            id: `history-${i}`,
+            role: m.role,
+            content: m.content,
+          }))
+        );
+      } catch {
+        // Backend unreachable — keep the welcome message; sending a chat
+        // will surface the connection error if the user tries.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Server-pushed proactive messages stream into their own bubble. The
+  // backend never pushes while a chat reply is streaming, so this cannot
+  // interleave with an in-flight answer.
+  useEffect(() => {
+    let proactiveId: string | null = null;
+    const unsubscribe = subscribeToEvents({
+      onStart: () => {
+        proactiveId = `proactive-${Date.now()}`;
+        setMessages((prev) => [
+          ...prev,
+          { id: proactiveId as string, role: "assistant", content: "" },
+        ]);
+      },
+      onToken: (text) => {
+        const id = proactiveId;
+        if (!id) return;
+        setMessages((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, content: m.content + text } : m))
+        );
+      },
+      onDone: ({ message }) => {
+        const bubbleId = proactiveId;
+        proactiveId = null;
+        // The done event carries the authoritative final text (streamed
+        // tokens can include whitespace the backend trimmed).
+        if (bubbleId) {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === bubbleId ? { ...m, content: message } : m))
+          );
+        }
+      },
+    });
+    return unsubscribe;
+  }, []);
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -46,18 +106,29 @@ export default function App() {
     setIsThinking(true);
 
     const replyId = `corvus-${Date.now()}`;
+    const statusId = `status-${Date.now()}`;
     let replyStarted = false;
+    let statusStarted = false;
 
     try {
-      await streamChat(text, conversationId ?? undefined, {
-        onConversation: (id) => setConversationId(id),
+      await streamChat(text, {
         onStatus: (text) => {
-          // Deep-recall status arrives before the reply; keep the thinking
-          // indicator up since tokens are still coming.
-          setMessages((prev) => [
-            ...prev,
-            { id: `status-${Date.now()}`, role: "assistant", content: text, status: true },
-          ]);
+          // Reasoning streams as fragments; fold them into one live status
+          // bubble per turn. Keep the thinking indicator up since the reply
+          // tokens are still coming.
+          if (!statusStarted) {
+            statusStarted = true;
+            setMessages((prev) => [
+              ...prev,
+              { id: statusId, role: "assistant", content: text, status: true },
+            ]);
+          } else {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === statusId ? { ...m, content: m.content + text } : m
+              )
+            );
+          }
         },
         onToken: (token) => {
           if (!replyStarted) {
@@ -91,7 +162,7 @@ export default function App() {
     } finally {
       setIsThinking(false);
     }
-  }, [input, isThinking, conversationId]);
+  }, [input, isThinking]);
 
   const canSend = input.trim().length > 0 && !isThinking;
 

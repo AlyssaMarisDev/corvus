@@ -5,7 +5,6 @@ import {
   deleteMemory,
   getMemoriesByTag,
   saveMemory,
-  searchDeletedMemories,
   searchMemories,
   searchMessages,
   updateMemory,
@@ -86,7 +85,9 @@ const extractionSchema = z.object({
 const extractor = new ChatGoogleGenerativeAI({
   model: process.env.GEMINI_MODEL,
   apiKey: process.env.GEMINI_API_KEY,
-  maxOutputTokens: 1024,
+  // Thinking models burn reasoning tokens against this budget; 1024 truncated
+  // the JSON mid-string (OutputParserException) whenever extraction thought hard.
+  maxOutputTokens: 8192,
 }).withStructuredOutput(extractionSchema);
 
 // Retrieval must never break chat: any failure degrades to no memories.
@@ -96,20 +97,6 @@ export async function retrieveMemories(text) {
     return await searchMemories(queryEmbedding);
   } catch (err) {
     logger.error({ err }, "memory retrieval failed; continuing without memories");
-    return [];
-  }
-}
-
-// Same never-throws contract as retrieveMemories; used by the deep-think
-// subgraph to search soft-deleted memories. Both tiers share one table, so a
-// single search returns regular and core rows together (tag included for
-// labeling); the wider limit keeps parity with the old per-tier searches.
-export async function retrieveDeletedMemories(text) {
-  try {
-    const queryEmbedding = await embed(text);
-    return await searchDeletedMemories(queryEmbedding, { limit: 8 });
-  } catch (err) {
-    logger.error({ err }, "deleted memory retrieval failed; continuing without them");
     return [];
   }
 }
@@ -125,12 +112,12 @@ export async function retrieveCoreMemories() {
   }
 }
 
-// Used by the deep-think subgraph to search messages from past conversations.
+// Used by the search_memory tool to search past conversation messages.
 // Same never-throws contract as retrieveMemories.
-export async function retrievePastConversations(text, { excludeConversationId } = {}) {
+export async function retrievePastConversations(text) {
   try {
     const queryEmbedding = await embed(text);
-    return await searchMessages(queryEmbedding, { excludeConversationId });
+    return await searchMessages(queryEmbedding);
   } catch (err) {
     logger.error({ err }, "past conversation retrieval failed; continuing without it");
     return [];

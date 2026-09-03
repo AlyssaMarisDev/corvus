@@ -5,30 +5,23 @@ import {
   START,
   StateGraph,
 } from "@langchain/langgraph";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
-import { dispatchCustomEvent } from "@langchain/core/callbacks/dispatch";
+import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { z } from "zod";
 import { buildSystemPrompt } from "./prompt.js";
-import { deepThinkGraph } from "./deepthink.js";
 import { getWorkingMemory, synthesizeInteraction } from "./brain.js";
 import { extractMemories, retrieveCoreMemories, retrieveMemories } from "./memory.js";
+import { DEEPSEEK_MODEL, DEEPSEEK_REASONING_EFFORT, streamDeepSeekReply } from "./deepseek.js";
+import { TOOLS } from "./tools/index.js";
 import { logger } from "./logger.js";
 
-// Deep recall is disabled while the working-memory integration is exercised
-// in isolation; flip to true to re-enable the think_deeper tool and the
-// deep-think subgraph.
-const DEEP_THINK_ENABLED = false;
-
-const model = new ChatGoogleGenerativeAI({
-  model: process.env.GEMINI_MODEL,
-  apiKey: process.env.GEMINI_API_KEY,
-  maxOutputTokens: 1024,
-});
+// Hard cap on set_reminder/web_search/search_memory tool rounds per turn,
+// independent of what the model emits. Corvus can call tools repeatedly
+// (e.g. search, read the results, search again) until it's satisfied or
+// this limit forces it to finalize as plain text.
+const MAX_TOOL_ROUNDS = 6;
 
 // Graph state: the conversation messages plus the long-term memories
-// retrieved for the latest user message. conversationId rides along so node
-// logs can be correlated with the request that triggered them.
+// retrieved for the latest user message.
 const CorvusAnnotation = Annotation.Root({
   ...MessagesAnnotation.spec,
   memories: Annotation({
@@ -45,78 +38,86 @@ const CorvusAnnotation = Annotation.Root({
     reducer: (_current, next) => next,
     default: () => [],
   }),
-  conversationId: Annotation({
+  // Counts completed set_reminder/web_search/search_memory tool rounds this
+  // turn; gates whether the corvus node keeps offering tools on the next
+  // pass. Corvus loops through as many rounds as it wants, up to
+  // MAX_TOOL_ROUNDS, before it must finalize a plain-text reply.
+  toolRounds: Annotation({
     reducer: (_current, next) => next,
-    default: () => undefined,
-  }),
-  // Set once the deep-think subgraph has run this turn; gates both the
-  // routing and whether the corvus node offers the think_deeper tool.
-  deepThinkUsed: Annotation({
-    reducer: (_current, next) => next,
-    default: () => false,
+    default: () => 0,
   }),
 });
 
-// Offered to the corvus node only until the subgraph has been used, so deep
-// recall can fire at most once per turn.
-const thinkDeeper = {
-  name: "think_deeper",
-  description:
-    "Deep-recall search over the user's long-term memories, including deleted ones. Findings tag each memory as [active] or [deleted] (outdated or contradicted). Call only when the conversation and the provided memories do not suffice to answer.",
-  schema: z.object({
-    directive: z
-      .string()
-      .describe("self-contained instruction for the deep-recall planner"),
-    status: z
-      .string()
-      .describe("short thinking-out-loud line shown to the user while searching"),
-  }),
-};
+// zod -> OpenAI/DeepSeek function-calling spec. $schema is metadata the API
+// doesn't want in "parameters".
+function toFunctionSpec({ name, description, schema }) {
+  const parameters = z.toJSONSchema(schema);
+  delete parameters.$schema;
+  return { type: "function", function: { name, description, parameters } };
+}
 
-// Streaming the model explicitly (rather than invoke) so token-level
-// on_chat_model_stream events reach streamEvents consumers.
+// Raw SSE stream rather than a LangChain chat model: the thinking parameters
+// and reasoning_content deltas need first-class control, and custom events
+// still surface tokens and reasoning to streamEvents consumers.
 async function callModel(state) {
   const start = performance.now();
+  // Corvus can loop through multiple tool rounds per turn: tools stay bound
+  // (see streamDeepSeekReply) and tool_choice stays "auto" so it may call
+  // again after seeing a result. Once MAX_TOOL_ROUNDS is reached, tool_choice
+  // flips to "none" so the model must finalize its reply as plain text.
+  const tools = TOOLS.map((t) => toFunctionSpec(t.definition));
+  const toolChoice = state.toolRounds >= MAX_TOOL_ROUNDS ? "none" : "auto";
   try {
-    // After the subgraph has run, the model must answer from the findings, so
-    // no tools are offered on the second call.
-    const activeModel =
-      DEEP_THINK_ENABLED && !state.deepThinkUsed ? model.bindTools([thinkDeeper]) : model;
-    const chunks = await activeModel.stream([
-      new SystemMessage(
-        buildSystemPrompt({
-          memories: state.memories,
-          coreMemories: state.coreMemories,
-          workingMemory: state.workingMemory,
-          deepThinkEnabled: DEEP_THINK_ENABLED,
-        })
-      ),
-      ...state.messages,
-    ]);
-    let response;
-    for await (const chunk of chunks) {
-      response = response ? response.concat(chunk) : chunk;
-    }
-    if (!response) {
+    const { content, reasoning, toolCalls } = await streamDeepSeekReply(
+      buildSystemPrompt({
+        memories: state.memories,
+        coreMemories: state.coreMemories,
+        workingMemory: state.workingMemory,
+        reminderToolEnabled: toolChoice === "auto",
+        webSearchToolEnabled: toolChoice === "auto",
+        searchMemoryToolEnabled: toolChoice === "auto",
+      }),
+      state.messages.map(toApiMessage),
+      { tools, toolChoice }
+    );
+    if (!content && !toolCalls.length) {
       throw new Error("model returned no content");
     }
     logger.info(
       {
-        model: process.env.GEMINI_MODEL,
+        model: DEEPSEEK_MODEL,
+        reasoningEffort: DEEPSEEK_REASONING_EFFORT,
         inputMessages: state.messages.length,
         memories: state.memories.length,
         coreMemories: state.coreMemories.length,
         workingMemory: state.workingMemory.length,
+        replyChars: content.length,
+        reasoningChars: reasoning.length,
+        toolCalls: toolCalls.length,
         durationMs: Math.round(performance.now() - start),
       },
       "llm call completed"
     );
-    return { messages: [response] };
+    if (toolCalls.length) {
+      // DeepSeek's thinking-mode contract: an assistant message carrying
+      // tool_calls must have its reasoning_content replayed on the next
+      // request in this turn (toApiMessage reads it back off here).
+      return {
+        messages: [
+          new AIMessage({
+            content: content || "",
+            tool_calls: toolCalls,
+            additional_kwargs: { reasoning_content: reasoning },
+          }),
+        ],
+      };
+    }
+    return { messages: [new AIMessage(content)] };
   } catch (err) {
     logger.error(
       {
         err,
-        model: process.env.GEMINI_MODEL,
+        model: DEEPSEEK_MODEL,
         durationMs: Math.round(performance.now() - start),
       },
       "llm call failed"
@@ -135,6 +136,42 @@ function chunkText(content) {
   return "";
 }
 
+// LangChain messages -> OpenAI chat format. tool_calls only appear on an AI
+// message within the current turn (history persisted to Postgres is always
+// flattened to plain text, see index.js), so replaying reasoning_content
+// only ever matters for the in-flight turn.
+function toApiMessage(message) {
+  const content = chunkText(message.content);
+  switch (message._getType()) {
+    case "human":
+      return { role: "user", content };
+    case "ai": {
+      const toolCalls = message.tool_calls ?? [];
+      if (!toolCalls.length) return { role: "assistant", content };
+      const apiMessage = {
+        role: "assistant",
+        content: content || null,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function",
+          function: { name: tc.name, arguments: JSON.stringify(tc.args ?? {}) },
+        })),
+      };
+      // Required by DeepSeek whenever a tool-calling assistant message is
+      // resent (see streamDeepSeekReply's doc comment).
+      const reasoningContent = message.additional_kwargs?.reasoning_content;
+      if (reasoningContent) apiMessage.reasoning_content = reasoningContent;
+      return apiMessage;
+    }
+    case "tool":
+      return { role: "tool", tool_call_id: message.tool_call_id, content };
+    case "system":
+      return { role: "system", content };
+    default:
+      return { role: "user", content };
+  }
+}
+
 // Populates state.memories, state.coreMemories, and state.workingMemory for
 // the corvus node. Retrieval failures degrade to empty lists inside
 // retrieveMemories, retrieveCoreMemories, and getWorkingMemory, so this node
@@ -148,7 +185,6 @@ async function retrieve(state) {
   ]);
   logger.info(
     {
-      conversationId: state.conversationId,
       memoryCount: memories.length,
       coreMemoryCount: coreMemories.length,
       workingMemoryCount: workingMemory.length,
@@ -158,53 +194,37 @@ async function retrieve(state) {
   return { memories, coreMemories, workingMemory };
 }
 
-// Runs the deep-recall subgraph for the think_deeper tool call and answers
-// the tool call with the consolidated findings, so the next corvus call sees
-// valid tool-call/tool-response history.
-async function deepThink(state) {
+// Executes every tool call from the latest corvus pass — however many the
+// model requested together, dispatched by name to the matching TOOLS entry
+// (see tools/index.js) — in one round, so no tool call is ever left
+// unanswered. Loops back to corvus afterward, which may call tools again
+// (up to MAX_TOOL_ROUNDS) if it isn't done yet.
+async function runTools(state) {
   const lastMessage = state.messages[state.messages.length - 1];
   const toolCalls = lastMessage?.tool_calls ?? [];
-  const call = toolCalls.find((tc) => tc.name === "think_deeper") ?? toolCalls[0];
-  const { directive, status } = call.args;
-
-  logger.info({ conversationId: state.conversationId, directive }, "deep-think subgraph invoked");
-  await dispatchCustomEvent("corvus_status", { text: status });
-
-  // conversationId travels via configurable so the fetch_past_conversations
-  // tool can exclude the current conversation from its search.
-  const result = await deepThinkGraph.invoke(
-    {
-      directive,
-      messages: [new HumanMessage(directive)],
-    },
-    { configurable: { conversationId: state.conversationId } }
+  const responses = await Promise.all(
+    toolCalls.map((tc) => {
+      const tool = TOOLS.find((t) => t.definition.name === tc.name);
+      if (tool) return tool.execute(tc);
+      // Any other unrecognized name still needs a response to keep the
+      // tool-call/tool-response history valid for the next corvus call.
+      logger.warn({ name: tc.name }, "unhandled tool call");
+      return new ToolMessage({ content: `Unknown tool "${tc.name}".`, tool_call_id: tc.id });
+    })
   );
-  const summary =
-    chunkText(result.messages[result.messages.length - 1]?.content) ||
-    "Nothing relevant was found in long-term memory.";
-
-  // Gemini requires a ToolMessage for every tool call; the subgraph runs
-  // once, so any extra parallel calls get a note instead of a second run.
-  const responses = toolCalls.map(
-    (tc) =>
-      new ToolMessage({
-        content:
-          tc.id === call.id
-            ? summary
-            : "Deep recall was already invoked for this turn.",
-        tool_call_id: tc.id,
-      })
-  );
-  return { messages: responses, deepThinkUsed: true };
+  return { messages: responses, toolRounds: state.toolRounds + 1 };
 }
 
 function routeAfterCorvus(state) {
-  if (!DEEP_THINK_ENABLED || state.deepThinkUsed) return "extract";
   const lastMessage = state.messages[state.messages.length - 1];
-  const wantsDeepThink = lastMessage?.tool_calls?.some(
-    (tc) => tc.name === "think_deeper"
-  );
-  return wantsDeepThink ? "deepThink" : "extract";
+  const toolCalls = lastMessage?.tool_calls ?? [];
+  // Any known tool call (see tools/index.js), however many were requested
+  // together, goes to runTools; callModel's MAX_TOOL_ROUNDS cap is what
+  // eventually forces this to fall through to extract.
+  if (toolCalls.some((tc) => TOOLS.some((t) => t.definition.name === tc.name))) {
+    return "tools";
+  }
+  return "extract";
 }
 
 // Revises long-term memory from the completed exchange and synthesizes it
@@ -221,41 +241,44 @@ async function extract(state) {
 }
 
 // Only the corvus node calls the chat model for the reply; retrieve/extract
-// handle long-term memory around it, and deepThink runs the recall subgraph
-// when corvus chooses think_deeper.
+// handle long-term memory around it, and tools executes any set_reminder/
+// web_search/search_memory calls. Every tool round loops back to corvus,
+// which decides whether to call again, up to MAX_TOOL_ROUNDS, or finalize
+// its reply.
 export const graph = new StateGraph(CorvusAnnotation)
   .addNode("retrieve", retrieve)
   .addNode("corvus", callModel)
-  .addNode("deepThink", deepThink)
+  .addNode("tools", runTools)
   .addNode("extract", extract)
   .addEdge(START, "retrieve")
   .addEdge("retrieve", "corvus")
   .addConditionalEdges("corvus", routeAfterCorvus, {
-    deepThink: "deepThink",
+    tools: "tools",
     extract: "extract",
   })
-  .addEdge("deepThink", "corvus")
+  .addEdge("tools", "corvus")
   .addEdge("extract", END)
   .compile();
 
-// Yields { type: "token" | "status", text } events: reply tokens as the model
-// generates them, plus the thinking-out-loud status when corvus invokes deep
-// recall. Callers concatenate token text to reconstruct the full reply. Once
-// the final corvus node ends, the rest of the run (memory extraction) is
-// drained in the background so it never delays the response.
-export async function* streamCorvus(messages, conversationId) {
-  const events = graph.streamEvents({ messages, conversationId }, { version: "v2" });
+// Yields { type: "token" | "status", text } events: reply tokens as DeepSeek
+// generates them, plus discrete tool-activity announcements as status events
+// (e.g. webSearch's "Searching the web…" line, or search_memory's
+// "Searching memory…" line) — never raw reasoning, which deepseek.js keeps
+// internal. Callers concatenate token text to reconstruct the full reply.
+// Once the final corvus node ends, the rest of the run (memory extraction)
+// is drained in the background so it never delays the response.
+export async function* streamCorvus(messages) {
+  const events = graph.streamEvents({ messages }, { version: "v2" });
   const iterator = events[Symbol.asyncIterator]();
   let replyComplete = false;
   try {
     while (true) {
       const { value: event, done } = await iterator.next();
       if (done) return;
-      if (
-        event.event === "on_chat_model_stream" &&
-        event.metadata?.langgraph_node === "corvus"
-      ) {
-        const text = chunkText(event.data?.chunk?.content);
+      // The corvus node streams over raw SSE, so tokens and reasoning arrive
+      // as custom events rather than on_chat_model_stream.
+      if (event.event === "on_custom_event" && event.name === "corvus_token") {
+        const text = event.data?.text;
         if (text) yield { type: "token", text };
       } else if (
         event.event === "on_custom_event" &&
@@ -264,8 +287,9 @@ export async function* streamCorvus(messages, conversationId) {
         const text = event.data?.text;
         if (text) yield { type: "status", text };
       } else if (event.event === "on_chain_end" && event.name === "corvus") {
-        // The corvus node runs twice on a deep-think turn; the first run ends
-        // in a tool call, so only the run without tool calls is the reply.
+        // The corvus node runs once per tool round plus a final pass on a
+        // turn with tool calls; every run but the last ends in a tool call,
+        // so only the run without tool calls is the reply.
         const outMessages = event.data?.output?.messages ?? [];
         const lastOut = outMessages[outMessages.length - 1];
         const outToolCalls = lastOut?.tool_calls ?? lastOut?.kwargs?.tool_calls ?? [];
