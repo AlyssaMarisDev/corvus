@@ -24,6 +24,21 @@ const MAX_REPLY_TOKENS = 8192;
 // tool_calls must also carry its original reasoning_content (messages
 // without tool_calls need none) — callers that replay a tool-calling turn
 // are responsible for attaching it (see agent.js).
+// DeepSeek's OpenAI-shaped usage object -> Langfuse's usageDetails shape.
+// Returns undefined when no usage arrived (e.g. stream_options wasn't
+// honored), so callers can spread it in without emitting an empty object.
+export function toUsageDetails(usage) {
+  if (!usage) return undefined;
+  return {
+    input: usage.prompt_tokens,
+    output: usage.completion_tokens,
+    total: usage.total_tokens,
+    ...(usage.prompt_cache_hit_tokens != null
+      ? { cache_read_input_tokens: usage.prompt_cache_hit_tokens }
+      : {}),
+  };
+}
+
 export async function streamDeepSeekReply(
   systemPrompt,
   messages,
@@ -42,6 +57,10 @@ export async function streamDeepSeekReply(
       reasoning_effort: DEEPSEEK_REASONING_EFFORT,
       max_tokens: MAX_REPLY_TOKENS,
       stream: true,
+      // Asks the API to emit a final chunk carrying token usage (see the
+      // usage capture below) — used to populate Langfuse's usageDetails
+      // (see agent.js/brain.js callers).
+      stream_options: { include_usage: true },
       // tools stays bound (with tool_choice "none") rather than omitted once
       // a tool has already been used this turn: history may already contain
       // a tool-calling assistant message, and dropping tools entirely risks
@@ -60,6 +79,10 @@ export async function streamDeepSeekReply(
   let buffer = "";
   let content = "";
   let reasoning = "";
+  // Populated once the stream_options: include_usage chunk arrives
+  // (typically last, with an empty choices array) — passed back to the
+  // caller for Langfuse's usageDetails.
+  let usage = null;
   // Sparse, indexed by the delta's tool_call index; name/id arrive once,
   // argument fragments accumulate across chunks.
   const toolCallDeltas = [];
@@ -76,7 +99,9 @@ export async function streamDeepSeekReply(
         if (!line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
         if (data === "[DONE]") continue;
-        const delta = JSON.parse(data).choices?.[0]?.delta ?? {};
+        const parsed = JSON.parse(data);
+        if (parsed.usage) usage = parsed.usage;
+        const delta = parsed.choices?.[0]?.delta ?? {};
         if (delta.reasoning_content) {
           // Kept for logging and for the reasoning_content replay contract
           // (see agent.js's toApiMessage), but never surfaced as a
@@ -112,5 +137,5 @@ export async function streamDeepSeekReply(
     }
     return { id: tc.id, name: tc.name, args };
   });
-  return { content, reasoning, toolCalls };
+  return { content, reasoning, toolCalls, usage };
 }

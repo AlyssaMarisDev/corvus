@@ -9,6 +9,7 @@ import { z } from "zod";
 import { HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import { dispatchCustomEvent } from "@langchain/core/callbacks/dispatch";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { endError, endOk, startChild } from "../tracing.js";
 import { logger } from "../logger.js";
 
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
@@ -83,11 +84,23 @@ const guard = new ChatGoogleGenerativeAI({
 
 // Never throws: a guard failure fails closed (treated as injection) so a
 // broken check can never let unchecked text through to the model.
-async function checkInjection(text) {
+async function checkInjection(text, parent) {
+  const generation = startChild(
+    parent,
+    "prompt-injection-guard",
+    {
+      model: GEMINI_GUARD_MODEL,
+      input: [{ role: "system", content: GUARD_PROMPT }, { role: "user", content: text }],
+    },
+    "generation"
+  );
   try {
-    return await guard.invoke([new SystemMessage(GUARD_PROMPT), new HumanMessage(text)]);
+    const verdict = await guard.invoke([new SystemMessage(GUARD_PROMPT), new HumanMessage(text)]);
+    endOk(generation, { output: verdict });
+    return verdict;
   } catch (err) {
     logger.error({ err }, "prompt-injection guard call failed; withholding result");
+    endError(generation, err);
     return { injection: true, reason: "guard call failed" };
   }
 }
@@ -97,14 +110,14 @@ async function checkInjection(text) {
 // compromised page can never inject instructions into Corvus's context.
 // Throws on search failure (tavilySearch/missing key); callers (executeWebSearch
 // below) turn that into a tool-error message rather than failing the turn.
-export async function performWebSearch(query) {
+export async function performWebSearch(query, parent) {
   if (!TAVILY_API_KEY) {
     throw new Error("TAVILY_API_KEY is not configured");
   }
   const results = await tavilySearch(query);
   if (!results.length) return "No results found.";
 
-  const verdicts = await Promise.all(results.map((r) => checkInjection(r.content)));
+  const verdicts = await Promise.all(results.map((r) => checkInjection(r.content, parent)));
 
   const lines = results.map((r, i) => {
     const verdict = verdicts[i];
@@ -129,7 +142,7 @@ export async function performWebSearch(query) {
 // corvus_status announcement so the frontend can show a "searching"
 // indicator (unlike DeepSeek's reasoning stream, this is a discrete,
 // user-facing activity note, not raw chain-of-thought).
-export async function executeWebSearch(tc) {
+export async function executeWebSearch(tc, parent) {
   const parsed = webSearchTool.schema.safeParse(tc.args);
   if (!parsed.success) {
     logger.warn({ args: tc.args, error: parsed.error.message }, "invalid web_search call");
@@ -141,7 +154,7 @@ export async function executeWebSearch(tc) {
   const { query } = parsed.data;
   await dispatchCustomEvent("corvus_status", { text: `Searching the web for "${query}"…` });
   try {
-    const findings = await performWebSearch(query);
+    const findings = await performWebSearch(query, parent);
     logger.info({ query }, "web search completed");
     return new ToolMessage({ content: findings, tool_call_id: tc.id });
   } catch (err) {

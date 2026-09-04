@@ -32,6 +32,21 @@ async function query(text, params) {
 // initDb creates the type and syncs values on boot.
 export const MEMORY_TAGS = ["core"];
 
+// The subject to use whenever a chat turn's origin doesn't resolve one of
+// its own (the web frontend has no identity at all; Discord messages from a
+// sender with no row in `subjects` fall back to this too) — this is the
+// single primary user of a personal Corvus instance. Configurable in case
+// that name ever needs to change without touching code.
+export const DEFAULT_SUBJECT = process.env.PRIMARY_SUBJECT ?? "bree";
+
+// Fixed subject for stable facts about Corvus itself — its own setup,
+// capabilities, or how it operates (e.g. "communicates with the user over
+// Discord and a web app") — rather than about whoever it's currently
+// speaking with. Core memories on this subject describe Corvus, not the
+// speaker, so they always apply no matter who's talking; getMemoriesByTag
+// surfaces them alongside the current speaker's own core memories.
+export const CORVUS_SUBJECT = "corvus";
+
 export async function initDb() {
   logger.info("initializing database");
   await query("CREATE EXTENSION IF NOT EXISTS vector;");
@@ -71,9 +86,16 @@ export async function initDb() {
     CREATE INDEX IF NOT EXISTS messages_embedding_idx
       ON messages USING hnsw (embedding vector_cosine_ops);
   `);
-  // Long-term memory: durable facts about the user, shared across all
-  // conversations and retrieved by semantic similarity. Deletes are soft:
-  // deleted_at IS NULL means the memory is active.
+  // Long-term memory: durable facts learned in conversation, shared across
+  // all conversations and retrieved by semantic similarity. Deletes are
+  // soft: deleted_at IS NULL means the memory is active. subject is who or
+  // what the fact is about — a name (matching a subjects.name row for a
+  // known speaker, e.g. "bree", or any other entity mentioned, e.g.
+  // "Quentin") or NULL for a general fact tied to no one in particular
+  // (e.g. "Corvus and the user communicate over Discord"). It's plain text
+  // rather than a foreign key: memories can be about entities (pets,
+  // places, other people) that never message Corvus and so never get a
+  // subjects row of their own.
   await query(`
     CREATE TABLE IF NOT EXISTS memories (
       id bigserial PRIMARY KEY,
@@ -82,7 +104,8 @@ export async function initDb() {
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now(),
       deleted_at timestamptz,
-      tag memory_tag
+      tag memory_tag,
+      subject text
     );
   `);
   // For databases created before soft delete existed.
@@ -91,6 +114,8 @@ export async function initDb() {
   );
   // For databases created before tags existed.
   await query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS tag memory_tag;");
+  // For databases created before subjects existed.
+  await query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS subject text;");
   await query(`
     CREATE INDEX IF NOT EXISTS memories_embedding_idx
       ON memories USING hnsw (embedding vector_cosine_ops);
@@ -108,6 +133,20 @@ export async function initDb() {
         DROP TABLE core_memories;
       END IF;
     END $$;
+  `);
+  // Identity mapping: which name (a memory subject, e.g. "bree") a given
+  // channel-specific sender id corresponds to, so an inbound message can be
+  // attributed to the right person. Only Discord is wired up today
+  // (discord_user_id), but the shape leaves room for other channels later.
+  // A name with no discord_user_id is fine (nothing maps to it yet); every
+  // column besides id/name/created_at is nullable for that reason.
+  await query(`
+    CREATE TABLE IF NOT EXISTS subjects (
+      id bigserial PRIMARY KEY,
+      name text NOT NULL UNIQUE,
+      discord_user_id text UNIQUE,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
   // Self-scheduled reminders: set_reminder (tools/setReminder.js) lets Corvus schedule
   // something to resurface into working memory at a future time. Recurring
@@ -203,13 +242,16 @@ export async function searchMessages(
 // Core-tagged rows are always excluded: they are already injected into
 // every system prompt and always given to the thought generator directly
 // (brain.js), so they must never surface here too — regular similarity
-// search only ever searches the non-core tier.
+// search only ever searches the non-core tier. Deliberately NOT filtered by
+// subject: a memory about "Quentin" or a general fact should surface
+// regardless of who's currently chatting — only the always-injected core
+// tier is scoped to the current speaker (see getMemoriesByTag).
 export async function searchMemories(
   queryEmbedding,
   { limit = 5, maxDistance = MEMORY_DISTANCE_CUTOFF } = {}
 ) {
   const { rows } = await query(
-    `SELECT id, content, tag, updated_at, embedding <=> $1 AS distance
+    `SELECT id, content, tag, subject, updated_at, embedding <=> $1 AS distance
      FROM memories
      WHERE deleted_at IS NULL AND tag IS DISTINCT FROM 'core' AND embedding <=> $1 < $2
      ORDER BY distance
@@ -219,18 +261,19 @@ export async function searchMemories(
   return rows;
 }
 
-export async function saveMemory(content, embedding, tag = null) {
-  await query("INSERT INTO memories (content, embedding, tag) VALUES ($1, $2, $3);", [
-    content,
-    toVectorLiteral(embedding),
-    tag,
-  ]);
+// subject is who/what the memory is about (see the memories table comment
+// in initDb) — a name, or null for a general fact tied to no one entity.
+export async function saveMemory(content, embedding, tag = null, subject = null) {
+  await query(
+    "INSERT INTO memories (content, embedding, tag, subject) VALUES ($1, $2, $3, $4);",
+    [content, toVectorLiteral(embedding), tag, subject]
+  );
 }
 
-export async function updateMemory(id, content, embedding) {
+export async function updateMemory(id, content, embedding, subject = null) {
   await query(
-    "UPDATE memories SET content = $2, embedding = $3, updated_at = now() WHERE id = $1;",
-    [id, content, toVectorLiteral(embedding)]
+    "UPDATE memories SET content = $2, embedding = $3, subject = $4, updated_at = now() WHERE id = $1;",
+    [id, content, toVectorLiteral(embedding), subject]
   );
 }
 
@@ -245,16 +288,65 @@ export async function deleteMemory(id) {
 // Tagged memories (e.g. core) are all injected into the system prompt, so
 // this fetches every active row with the tag rather than
 // similarity-searching; the limit is a sanity cap, not a relevance cutoff.
-export async function getMemoriesByTag(tag, { limit = 25 } = {}) {
+// Scoped to whoever is currently speaking: rows whose subject matches
+// `subject` (their own identity/interaction-preference facts), rows tagged
+// CORVUS_SUBJECT (stable facts about Corvus itself — always relevant no
+// matter who's talking), or rows with no subject at all (general core
+// facts) — but never another named subject's core facts. Pass
+// DEFAULT_SUBJECT for callers with no specific speaker (the thought loop,
+// reminder delivery). The CORVUS_SUBJECT comparison is case-insensitive
+// since it's a literal an LLM extraction writes freeform, not an enforced
+// enum value.
+export async function getMemoriesByTag(tag, { subject = null, limit = 25 } = {}) {
   const { rows } = await query(
-    `SELECT id, content, updated_at
+    `SELECT id, content, subject, updated_at
      FROM memories
      WHERE deleted_at IS NULL AND tag = $1
+       AND (subject IS NULL OR subject = $2 OR lower(subject) = lower($3))
      ORDER BY id
-     LIMIT $2;`,
-    [tag, limit]
+     LIMIT $4;`,
+    [tag, subject, CORVUS_SUBJECT, limit]
   );
   return rows;
+}
+
+// One-off migration support (see backfill-memory-subjects.js): active
+// memories at or below `maxId` still missing a subject — i.e. saved before
+// the subject column existed. Bounded by maxId (the highest memories.id
+// present before that migration shipped) so a later rerun can never touch
+// a genuinely general (subject-less) memory saved afterward by the
+// broadened extractor.
+export async function getMemoriesWithoutSubject({ maxId, limit = 100 } = {}) {
+  const { rows } = await query(
+    `SELECT id, content
+     FROM memories
+     WHERE deleted_at IS NULL AND subject IS NULL AND id <= $1
+     ORDER BY id
+     LIMIT $2;`,
+    [maxId, limit]
+  );
+  return rows;
+}
+
+// Upserts the (name, discord_user_id) mapping used to attribute inbound
+// Discord messages to a memory subject (see discord.js). Safe to call every
+// boot: re-affirms the mapping if DISCORD_ALLOWED_USER_ID changed.
+export async function ensureSubject(name, discordUserId = null) {
+  await query(
+    `INSERT INTO subjects (name, discord_user_id) VALUES ($1, $2)
+     ON CONFLICT (name) DO UPDATE SET discord_user_id = EXCLUDED.discord_user_id;`,
+    [name, discordUserId]
+  );
+}
+
+// Resolves an inbound Discord sender to their memory subject name, or null
+// if nobody's been mapped to that id yet (the caller falls back to
+// DEFAULT_SUBJECT).
+export async function getSubjectNameByDiscordId(discordUserId) {
+  const { rows } = await query("SELECT name FROM subjects WHERE discord_user_id = $1;", [
+    discordUserId,
+  ]);
+  return rows[0]?.name ?? null;
 }
 
 // A memory's selection weight decays exponentially with its age (by
@@ -271,7 +363,7 @@ const MEMORY_PULL_HALFLIFE_SECONDS = 7 * 24 * 60 * 60;
 // Returns { content, updated_at }, or null when there are no eligible rows.
 export async function getRandomMemory() {
   const { rows } = await query(
-    `SELECT content, updated_at
+    `SELECT content, subject, updated_at
      FROM memories
      WHERE deleted_at IS NULL AND tag IS DISTINCT FROM 'core'
      ORDER BY -ln(1 - random()) / exp(-EXTRACT(EPOCH FROM (now() - updated_at)) * ln(2) / $1)

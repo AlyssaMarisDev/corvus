@@ -18,8 +18,10 @@ import {
   buildSystemPrompt,
   formatFullTimestamp,
 } from "./prompt.js";
-import { DEEPSEEK_MODEL, streamDeepSeekReply } from "./deepseek.js";
+import { DEEPSEEK_MODEL, streamDeepSeekReply, toUsageDetails } from "./deepseek.js";
 import { broadcast } from "./events.js";
+import { sendDiscordMessage, discordEnabled } from "./discord.js";
+import { endError, endOk, startChild, startTrace } from "./tracing.js";
 import { logger } from "./logger.js";
 
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:4203";
@@ -121,8 +123,12 @@ function thoughtEntry(content) {
 // Core memories never reach working memory (they're always given to the
 // thought generator directly, see generateThought/judgeThought below), so
 // every entry built here is necessarily a regular memory.
-function memoryEntry({ content, updated_at }) {
-  return `[memory · ${formatFullTimestamp(updated_at)}] ${content}`;
+// subject labels who/what a regular memory is about (see db.js's memories
+// table and prompt.js's formatMemoryLine, which does the same for the
+// system prompt's memory list); omitted when null (a general fact).
+function memoryEntry({ content, updated_at, subject }) {
+  const label = subject ? `[${subject}] ` : "";
+  return `[memory · ${formatFullTimestamp(updated_at)}] ${label}${content}`;
 }
 
 function messageEntry({ role, created_at, content }) {
@@ -164,30 +170,47 @@ async function addWorkingMemoryEntry(entry, ttlSeconds = THOUGHT_TTL_SECONDS) {
 // Shared DeepSeek call for the brain's writing (thoughts, interaction
 // synthesis, thought judging). Thinking mode stays disabled: all callers
 // are latency-sensitive background work. json enables DeepSeek's JSON
-// output mode, which requires the prompt to ask for JSON.
-async function deepseekChat(systemPrompt, userContent, maxTokens, { json = false } = {}) {
-  const response = await fetch("https://api.deepseek.com/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userContent },
-      ],
-      thinking: { type: "disabled" },
-      max_tokens: maxTokens,
-      ...(json ? { response_format: { type: "json_object" } } : {}),
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`DeepSeek chat failed: ${response.status} ${await response.text()}`);
+// output mode, which requires the prompt to ask for JSON. parent/name
+// wrap the call in a Langfuse generation observation — every caller passes
+// its own trace (a thought tick, or the chat trace's extract span) plus a
+// name identifying which of the brain's writing tasks this is.
+async function deepseekChat(
+  systemPrompt,
+  userContent,
+  maxTokens,
+  { json = false, parent, name = "deepseek-chat" } = {}
+) {
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userContent },
+  ];
+  const generation = startChild(parent, name, { model: DEEPSEEK_MODEL, input: messages }, "generation");
+  try {
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages,
+        thinking: { type: "disabled" },
+        max_tokens: maxTokens,
+        ...(json ? { response_format: { type: "json_object" } } : {}),
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`DeepSeek chat failed: ${response.status} ${await response.text()}`);
+    }
+    const data = await response.json();
+    const content = data.choices[0].message.content.trim();
+    endOk(generation, { output: content, usageDetails: toUsageDetails(data.usage) });
+    return content;
+  } catch (err) {
+    endError(generation, err);
+    throw err;
   }
-  const data = await response.json();
-  return data.choices[0].message.content.trim();
 }
 
 // Core memories are always-apply facts about the user (identity, interaction
@@ -197,34 +220,59 @@ function formatCoreMemories(coreMemories) {
   return coreMemories.length ? coreMemories.map((m) => `- ${m.content}`).join("\n") : "(none)";
 }
 
-async function generateThought(existingThoughts, coreMemories) {
+async function generateThought(existingThoughts, coreMemories, trace) {
   const workingMemory = existingThoughts.length
     ? existingThoughts.map((t, i) => `${i + 1}. ${t}`).join("\n")
     : "(working memory is empty)";
   return deepseekChat(
     THOUGHT_PROMPT,
     `Current date and time: ${formatFullTimestamp(new Date())}.\n\nCore profile (always apply):\n${formatCoreMemories(coreMemories)}\n\nCurrent working memory:\n${workingMemory}`,
-    128
+    128,
+    { parent: trace, name: "generate-thought" }
   );
 }
 
-// Synthesizes a completed chat exchange into a short anchor summary and
-// stores it in working memory with the long interaction TTL, so the brain
-// stays grounded in what actually just happened between user and Corvus.
-// Never throws — synthesis is post-reply background work.
-export async function synthesizeInteraction(userText, replyText) {
+// Shared by every interaction-synthesis call site (a chat exchange, or a
+// proactive/reminder message Corvus sent unprompted): asks the small model
+// to condense `content` into a short third-person anchor summary and stores
+// it in working memory with the long interaction TTL, so the brain stays
+// grounded in what actually just happened. Never throws — synthesis is
+// always post-send background work.
+async function storeInteractionSummary(content, parent) {
+  const summary = await deepseekChat(INTERACTION_SYNTHESIS_PROMPT, content, 160, {
+    parent,
+    name: "synthesize-interaction",
+  });
+  const entry = interactionEntry(summary);
+  await addWorkingMemoryEntry(entry, INTERACTION_TTL_SECONDS);
+  logger.info({ interaction: entry }, "interaction synthesized into working memory");
+}
+
+// Synthesizes a completed chat exchange into working memory. See
+// storeInteractionSummary.
+export async function synthesizeInteraction(userText, replyText, parent) {
   try {
     if (!(await ensureConnected())) return;
-    const summary = await deepseekChat(
-      INTERACTION_SYNTHESIS_PROMPT,
-      `User: ${userText}\nButler: ${replyText}`,
-      160
-    );
-    const entry = interactionEntry(summary);
-    await addWorkingMemoryEntry(entry, INTERACTION_TTL_SECONDS);
-    logger.info({ interaction: entry }, "interaction synthesized into working memory");
+    await storeInteractionSummary(`User: ${userText}\nButler: ${replyText}`, parent);
   } catch (err) {
     logger.error({ err }, "interaction synthesis failed");
+  }
+}
+
+// Same as synthesizeInteraction, but for a message Corvus sent unprompted
+// (a voiced thought or a delivered reminder — see sendProactiveMessage).
+// There's no user turn to summarize, so `context` describes what prompted
+// Corvus to speak (the thought, or the reminder it fired on) and the model
+// is asked to summarize that it acted on it, not just what it said — this
+// is what lets the thought loop recognize a reminder as already delivered
+// instead of re-surfacing it as unaddressed (see THOUGHT_PROMPT/
+// THOUGHT_JUDGE_PROMPT).
+async function synthesizeProactiveInteraction(context, message, parent) {
+  try {
+    if (!(await ensureConnected())) return;
+    await storeInteractionSummary(`${context}\nButler said: ${message}`, parent);
+  } catch (err) {
+    logger.error({ err }, "proactive interaction synthesis failed");
   }
 }
 
@@ -235,9 +283,9 @@ export async function synthesizeInteraction(userText, replyText) {
 // directly instead. The distance cutoffs in searchMemories/searchMessages
 // mean an unrelated thought surfaces nothing. Never throws — a failure here
 // must not cost the thought's log line.
-async function surfaceRelatedContext(thought) {
+async function surfaceRelatedContext(thought, parent) {
   try {
-    const embedding = await embed(thought);
+    const embedding = await embed(thought, parent);
     const [[memoryMatch], [messageMatch]] = await Promise.all([
       searchMemories(embedding, { limit: 1 }),
       searchMessages(embedding, { limit: 1 }),
@@ -258,7 +306,7 @@ async function surfaceRelatedContext(thought) {
 // memories and messages it just surfaced — plus the always-apply core
 // profile, and answers JSON {"surface": bool, "reason": str}. Any doubt or
 // parse failure means no.
-async function judgeThought(workingMemory, coreMemories) {
+async function judgeThought(workingMemory, coreMemories, trace) {
   const entries = workingMemory.length
     ? workingMemory.map((e, i) => `${i + 1}. ${e}`).join("\n")
     : "(working memory is empty)";
@@ -266,7 +314,7 @@ async function judgeThought(workingMemory, coreMemories) {
     THOUGHT_JUDGE_PROMPT,
     `Current date and time: ${formatFullTimestamp(new Date())}.\n\nCore profile (always apply):\n${formatCoreMemories(coreMemories)}\n\nCurrent working memory (oldest first; the final [thought] entry is the candidate):\n${entries}`,
     128,
-    { json: true }
+    { json: true, parent: trace, name: "judge-thought" }
   );
   try {
     const parsed = JSON.parse(raw);
@@ -290,17 +338,24 @@ async function generateProactiveMessage({
   trigger,
   promptAddendum,
   onToken,
+  parent,
+  name,
 }) {
   const systemPrompt = `${buildSystemPrompt({
     coreMemories,
     workingMemory,
   })}\n\n${promptAddendum}`;
+  const userMessage = { role: "user", content: trigger };
+  const generation = startChild(
+    parent,
+    name,
+    { model: DEEPSEEK_MODEL, input: [{ role: "system", content: systemPrompt }, userMessage] },
+    "generation"
+  );
   let heldBack = "";
   let streaming = false;
-  const { content } = await streamDeepSeekReply(
-    systemPrompt,
-    [{ role: "user", content: trigger }],
-    {
+  try {
+    const { content, usage } = await streamDeepSeekReply(systemPrompt, [userMessage], {
       emitEvents: false,
       onToken: (text) => {
         if (streaming) {
@@ -314,11 +369,19 @@ async function generateProactiveMessage({
         streaming = true;
         onToken(heldBack);
       },
-    }
-  );
-  const message = content.trim();
-  if (!message || message === SILENT_SENTINEL) return null;
-  return message;
+    });
+    const message = content.trim();
+    const declined = !message || message === SILENT_SENTINEL;
+    endOk(generation, {
+      output: declined ? SILENT_SENTINEL : message,
+      usageDetails: toUsageDetails(usage),
+      metadata: { declined },
+    });
+    return declined ? null : message;
+  } catch (err) {
+    endError(generation, err);
+    throw err;
+  }
 }
 
 // Cooldown state for the proactive pipeline, plus the count of chat replies
@@ -344,12 +407,18 @@ export function notifyChatStreamEnd() {
 // the conversation, push it to connected clients, and echo it back into
 // working memory so the brain knows it just spoke. Streaming (proactive_
 // start/token) already happened via generateProactiveMessage's onToken;
-// this only sends the final "done" broadcast.
-async function sendProactiveMessage(message) {
+// this only sends the final "done" broadcast. `interactionContext` describes
+// what prompted the message (the voiced thought, or the reminder that
+// fired) and is synthesized into an [interaction] anchor alongside the
+// literal [message] entry — without it, working memory only ever recorded
+// the raw text Corvus sent, never an explicit "I acted on this" anchor, so
+// the brain could see a still-present [reminder] entry and think it hadn't
+// been handled yet even after delivery.
+async function sendProactiveMessage(message, interactionContext, parent) {
   const messageId = await saveMessage("assistant", message);
   // Same background-embed pattern as the chat route; a failure leaves
   // embedding NULL, which the backfill script repairs on its next run.
-  void embed(message)
+  void embed(message, parent)
     .then((e) => saveMessageEmbedding(messageId, e))
     .catch((err) => logger.error({ err }, "proactive message embedding failed"));
   // Ground the brain in the fact that it just reached out, so subsequent
@@ -358,7 +427,18 @@ async function sendProactiveMessage(message) {
     messageEntry({ role: "assistant", created_at: new Date(), content: message }),
     INTERACTION_TTL_SECONDS
   );
+  await synthesizeProactiveInteraction(interactionContext, message, parent);
   broadcast("proactive_done", { message });
+  // Point-in-time marker of the exact moment this message went out over
+  // the /events SSE channel — this is what answers "when was this pushed"
+  // in Langfuse, distinct from the generation that composed it.
+  startChild(parent, "push-to-frontend", { input: { message }, metadata: { channel: "sse:/events" } }, "event");
+  // Same message, over Discord — sendDiscordMessage never throws (see
+  // discord.js), so this can never break the SSE push above.
+  if (discordEnabled) {
+    void sendDiscordMessage(message);
+    startChild(parent, "push-to-discord", { input: { message }, metadata: { channel: "discord" } }, "event");
+  }
 }
 
 // The proactive pipeline: judge the just-generated thought, and when
@@ -366,11 +446,11 @@ async function sendProactiveMessage(message) {
 // message. coreMemories comes from the caller (tick), which already fetched
 // it for generateThought — reused here rather than fetched again. Never
 // throws — it runs inside the tick.
-async function maybeVoiceThought(thought, workingMemory, coreMemories) {
+async function maybeVoiceThought(thought, workingMemory, coreMemories, trace) {
   if (!PROACTIVE_ENABLED || activeChatStreams > 0) return;
   if (Date.now() - lastVoiceAttemptAt < PROACTIVE_COOLDOWN_MS) return;
   try {
-    const verdict = await judgeThought(workingMemory, coreMemories);
+    const verdict = await judgeThought(workingMemory, coreMemories, trace);
     logger.info({ thought, ...verdict }, "thought judged");
     if (!verdict.surface) return;
     lastVoiceAttemptAt = Date.now();
@@ -383,6 +463,8 @@ async function maybeVoiceThought(thought, workingMemory, coreMemories) {
         `A thought from your subconscious passed an initial relevance check:\n\n"${thought}"\n\n` +
         `Decide whether to actually message the user. Reply with only your message, or exactly ${SILENT_SENTINEL} to stay silent.`,
       promptAddendum: PROACTIVE_PROMPT,
+      parent: trace,
+      name: "voice-thought",
       onToken: (text) => {
         if (!started) {
           started = true;
@@ -396,7 +478,11 @@ async function maybeVoiceThought(thought, workingMemory, coreMemories) {
       return;
     }
 
-    await sendProactiveMessage(message);
+    await sendProactiveMessage(
+      message,
+      `Corvus spoke unprompted, following up on its own thought: "${thought}"`,
+      trace
+    );
     logger.info(
       { thought, messageLength: message.length },
       "proactive message sent"
@@ -417,6 +503,14 @@ async function maybeVoiceThought(thought, workingMemory, coreMemories) {
 // without needing to touch the thought/judge pipeline above.
 async function deliverReminder(reminder) {
   if (!PROACTIVE_ENABLED) return;
+  // Reminders get their own trace (distinct from the thought-tick trace
+  // that resurfaced them into working memory, see checkReminders): the
+  // "push llm call" that composes the delivery message is a generation
+  // span inside it, and sendProactiveMessage logs the actual SSE push as
+  // an event in the same trace.
+  const trace = startTrace("reminder-delivery", {
+    input: { reminderId: reminder.id, content: reminder.content, dueAt: reminder.due_at },
+  });
   try {
     const workingMemory = await currentWorkingMemory();
     const coreMemories = await retrieveCoreMemories();
@@ -426,6 +520,8 @@ async function deliverReminder(reminder) {
       coreMemories,
       trigger: `Reminder: ${reminder.content}`,
       promptAddendum: REMINDER_DELIVERY_PROMPT,
+      parent: trace,
+      name: "deliver-reminder",
       onToken: (text) => {
         if (!started) {
           started = true;
@@ -438,10 +534,15 @@ async function deliverReminder(reminder) {
       // REMINDER_DELIVERY_PROMPT forbids silence; a model that ignores that
       // is worth knowing about rather than silently swallowing the miss.
       logger.warn({ reminder: reminder.content }, "reminder delivery produced no message");
+      endOk(trace, { output: { delivered: false } });
       return;
     }
 
-    await sendProactiveMessage(message);
+    await sendProactiveMessage(
+      message,
+      `A reminder Corvus had set for itself just fired and was delivered: "${reminder.content}"`,
+      trace
+    );
     // Delivering a reminder is still "the brain speaking up," so it feeds
     // the same cooldown as an ordinary proactive message — otherwise a
     // reminder firing right before an organic thought would let both go out
@@ -451,8 +552,10 @@ async function deliverReminder(reminder) {
       { reminder: reminder.content, messageLength: message.length },
       "reminder delivered"
     );
+    endOk(trace, { output: { delivered: true, message } });
   } catch (err) {
     logger.error({ err, reminder: reminder.content }, "reminder delivery failed");
+    endError(trace, err);
   }
 }
 
@@ -475,8 +578,15 @@ let ticking = false;
 async function tick() {
   if (ticking) return;
   ticking = true;
+  // One trace per thought-loop tick: the thought generation, the judge's
+  // verdict, and (if approved) the proactive message and its push event
+  // all nest under this single trace (see maybeVoiceThought).
+  const trace = startTrace("thought-tick", {});
   try {
-    if (!(await ensureConnected())) return;
+    if (!(await ensureConnected())) {
+      endOk(trace, { output: { skipped: "redis not connected" } });
+      return;
+    }
     const generationStart = performance.now();
     // Core memories are always given to the thought generator (and later
     // the judge) directly, rather than left to randomly surface into
@@ -486,12 +596,12 @@ async function tick() {
       retrieveCoreMemories(),
       currentWorkingMemory(),
     ]);
-    const thought = await generateThought(existingThoughts, coreMemories);
+    const thought = await generateThought(existingThoughts, coreMemories, trace);
     const generationMs = Math.round(performance.now() - generationStart);
     await redis.set(workingMemoryKey(), thoughtEntry(thought), {
       expiration: { type: "EX", value: THOUGHT_TTL_SECONDS },
     });
-    const { surfacedMemory, surfacedMessage } = await surfaceRelatedContext(thought);
+    const { surfacedMemory, surfacedMessage } = await surfaceRelatedContext(thought, trace);
     // Fetched after the writes so the log shows the true current state,
     // new thought and surfaced entries included.
     const workingMemory = await currentWorkingMemory();
@@ -501,9 +611,11 @@ async function tick() {
     );
     // The thought and its surfaced context are in working memory, so the
     // judge sees the full picture when deciding whether to speak up.
-    await maybeVoiceThought(thought, workingMemory, coreMemories);
+    await maybeVoiceThought(thought, workingMemory, coreMemories, trace);
+    endOk(trace, { output: { thought, surfacedMemory, surfacedMessage } });
   } catch (err) {
     logger.error({ err }, "thought tick failed");
+    endError(trace, err);
   } finally {
     ticking = false;
   }

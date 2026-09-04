@@ -14,7 +14,7 @@ import { logger } from "../logger.js";
 export const searchMemoryTool = {
   name: "search_memory",
   description:
-    "Search your long-term memories about the user and their past conversation messages by semantic similarity to a short query. Returns whatever matches from either. Use it when the conversation and the memories already provided to you don't cover what's being asked.",
+    "Search your long-term memories (about the user, other people/pets/things in their life, or general facts) and their past conversation messages by semantic similarity to a short query. Returns whatever matches from either. Use it when the conversation and the memories already provided to you don't cover what's being asked.",
   schema: z.object({
     query: z.string().describe("short search phrase to match memories and past messages against"),
   }),
@@ -23,7 +23,10 @@ export const searchMemoryTool = {
 function formatMemoryResults(memories) {
   if (!memories.length) return "No matching long-term memories found.";
   return memories
-    .map((m) => `- ${m.content} (last updated: ${formatMemoryTimestamp(m.updated_at)})`)
+    .map((m) => {
+      const label = m.subject ? `[${m.subject}] ` : "";
+      return `- ${label}${m.content} (last updated: ${formatMemoryTimestamp(m.updated_at)})`;
+    })
     .join("\n");
 }
 
@@ -45,7 +48,7 @@ function formatConversationResults(messages) {
 // no results instead) and answers with both sets of findings so the next
 // corvus call sees valid tool-call/tool-response history. Dispatches a
 // corvus_status announcement, same pattern as executeWebSearch.
-export async function executeSearchMemory(tc) {
+export async function executeSearchMemory(tc, parent) {
   const parsed = searchMemoryTool.schema.safeParse(tc.args);
   if (!parsed.success) {
     logger.warn({ args: tc.args, error: parsed.error.message }, "invalid search_memory call");
@@ -57,8 +60,8 @@ export async function executeSearchMemory(tc) {
   const { query } = parsed.data;
   await dispatchCustomEvent("corvus_status", { text: `Searching memory for "${query}"…` });
   const [memories, pastMessages] = await Promise.all([
-    retrieveMemories(query),
-    retrievePastConversations(query),
+    retrieveMemories(query, parent),
+    retrievePastConversations(query, parent),
   ]);
   logger.info(
     { query, memories: memories.length, pastMessages: pastMessages.length },

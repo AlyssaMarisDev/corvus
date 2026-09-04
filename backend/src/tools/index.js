@@ -8,9 +8,11 @@
 import { setReminderTool, executeSetReminder } from "./setReminder.js";
 import { webSearchTool, executeWebSearch } from "./webSearch.js";
 import { searchMemoryTool, executeSearchMemory } from "./searchMemory.js";
+import { saveMemoryTool, executeSaveMemory } from "./saveMemory.js";
 
 export const TOOLS = [
   { definition: setReminderTool, execute: executeSetReminder },
   { definition: webSearchTool, execute: executeWebSearch },
   { definition: searchMemoryTool, execute: executeSearchMemory },
+  { definition: saveMemoryTool, execute: executeSaveMemory },
 ];

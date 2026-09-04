@@ -10,11 +10,18 @@ import { z } from "zod";
 import { buildSystemPrompt } from "./prompt.js";
 import { getWorkingMemory, synthesizeInteraction } from "./brain.js";
 import { extractMemories, retrieveCoreMemories, retrieveMemories } from "./memory.js";
-import { DEEPSEEK_MODEL, DEEPSEEK_REASONING_EFFORT, streamDeepSeekReply } from "./deepseek.js";
+import { DEFAULT_SUBJECT } from "./db.js";
+import {
+  DEEPSEEK_MODEL,
+  DEEPSEEK_REASONING_EFFORT,
+  streamDeepSeekReply,
+  toUsageDetails,
+} from "./deepseek.js";
 import { TOOLS } from "./tools/index.js";
+import { endError, endOk, startChild } from "./tracing.js";
 import { logger } from "./logger.js";
 
-// Hard cap on set_reminder/web_search/search_memory tool rounds per turn,
+// Hard cap on set_reminder/web_search/search_memory/save_memory tool rounds per turn,
 // independent of what the model emits. Corvus can call tools repeatedly
 // (e.g. search, read the results, search again) until it's satisfied or
 // this limit forces it to finalize as plain text.
@@ -38,13 +45,27 @@ const CorvusAnnotation = Annotation.Root({
     reducer: (_current, next) => next,
     default: () => [],
   }),
-  // Counts completed set_reminder/web_search/search_memory tool rounds this
+  // Counts completed set_reminder/web_search/search_memory/save_memory tool rounds this
   // turn; gates whether the corvus node keeps offering tools on the next
   // pass. Corvus loops through as many rounds as it wants, up to
   // MAX_TOOL_ROUNDS, before it must finalize a plain-text reply.
   toolRounds: Annotation({
     reducer: (_current, next) => next,
     default: () => 0,
+  }),
+  // The Langfuse trace for this /chat request (see tracing.js and
+  // index.js), threaded through every node so each LLM/tool call nests
+  // under it as a child observation. Never reassigned by a node, so the
+  // reducer just keeps whatever was set on the initial invocation.
+  trace: Annotation({
+    reducer: (_current, next) => next ?? _current,
+    default: () => null,
+  }),
+  // Who's actually talking this turn (a memory subject, e.g. "bree") —
+  // resolved by the caller (chatTurn.js) and never reassigned by a node.
+  subject: Annotation({
+    reducer: (_current, next) => next ?? _current,
+    default: () => DEFAULT_SUBJECT,
   }),
 });
 
@@ -67,17 +88,30 @@ async function callModel(state) {
   // flips to "none" so the model must finalize its reply as plain text.
   const tools = TOOLS.map((t) => toFunctionSpec(t.definition));
   const toolChoice = state.toolRounds >= MAX_TOOL_ROUNDS ? "none" : "auto";
+  const systemPrompt = buildSystemPrompt({
+    memories: state.memories,
+    coreMemories: state.coreMemories,
+    workingMemory: state.workingMemory,
+    reminderToolEnabled: toolChoice === "auto",
+    webSearchToolEnabled: toolChoice === "auto",
+    searchMemoryToolEnabled: toolChoice === "auto",
+    saveMemoryToolEnabled: toolChoice === "auto",
+  });
+  const apiMessages = state.messages.map(toApiMessage);
+  const generation = startChild(
+    state.trace,
+    "deepseek-chat",
+    {
+      model: DEEPSEEK_MODEL,
+      modelParameters: { reasoningEffort: DEEPSEEK_REASONING_EFFORT, toolChoice },
+      input: [{ role: "system", content: systemPrompt }, ...apiMessages],
+    },
+    "generation"
+  );
   try {
-    const { content, reasoning, toolCalls } = await streamDeepSeekReply(
-      buildSystemPrompt({
-        memories: state.memories,
-        coreMemories: state.coreMemories,
-        workingMemory: state.workingMemory,
-        reminderToolEnabled: toolChoice === "auto",
-        webSearchToolEnabled: toolChoice === "auto",
-        searchMemoryToolEnabled: toolChoice === "auto",
-      }),
-      state.messages.map(toApiMessage),
+    const { content, reasoning, toolCalls, usage } = await streamDeepSeekReply(
+      systemPrompt,
+      apiMessages,
       { tools, toolChoice }
     );
     if (!content && !toolCalls.length) {
@@ -98,6 +132,11 @@ async function callModel(state) {
       },
       "llm call completed"
     );
+    endOk(generation, {
+      output: toolCalls.length ? { content, tool_calls: toolCalls } : { content },
+      usageDetails: toUsageDetails(usage),
+      metadata: { reasoning },
+    });
     if (toolCalls.length) {
       // DeepSeek's thinking-mode contract: an assistant message carrying
       // tool_calls must have its reasoning_content replayed on the next
@@ -122,6 +161,7 @@ async function callModel(state) {
       },
       "llm call failed"
     );
+    endError(generation, err);
     throw err;
   }
 }
@@ -178,9 +218,11 @@ function toApiMessage(message) {
 // never fails the run.
 async function retrieve(state) {
   const lastMessage = state.messages[state.messages.length - 1];
+  const query = chunkText(lastMessage?.content);
+  const span = startChild(state.trace, "retrieve", { input: { query, subject: state.subject } });
   const [memories, coreMemories, workingMemory] = await Promise.all([
-    retrieveMemories(chunkText(lastMessage?.content)),
-    retrieveCoreMemories(),
+    retrieveMemories(query, span),
+    retrieveCoreMemories(state.subject),
     getWorkingMemory(),
   ]);
   logger.info(
@@ -191,6 +233,13 @@ async function retrieve(state) {
     },
     "context retrieved"
   );
+  endOk(span, {
+    output: {
+      memories: memories.length,
+      coreMemories: coreMemories.length,
+      workingMemory: workingMemory.length,
+    },
+  });
   return { memories, coreMemories, workingMemory };
 }
 
@@ -203,13 +252,26 @@ async function runTools(state) {
   const lastMessage = state.messages[state.messages.length - 1];
   const toolCalls = lastMessage?.tool_calls ?? [];
   const responses = await Promise.all(
-    toolCalls.map((tc) => {
+    toolCalls.map(async (tc) => {
       const tool = TOOLS.find((t) => t.definition.name === tc.name);
-      if (tool) return tool.execute(tc);
-      // Any other unrecognized name still needs a response to keep the
-      // tool-call/tool-response history valid for the next corvus call.
-      logger.warn({ name: tc.name }, "unhandled tool call");
-      return new ToolMessage({ content: `Unknown tool "${tc.name}".`, tool_call_id: tc.id });
+      if (!tool) {
+        // Any other unrecognized name still needs a response to keep the
+        // tool-call/tool-response history valid for the next corvus call.
+        logger.warn({ name: tc.name }, "unhandled tool call");
+        return new ToolMessage({ content: `Unknown tool "${tc.name}".`, tool_call_id: tc.id });
+      }
+      // A "tool" observation per call, nested under the chat trace; the
+      // tool's own execute() (webSearch/searchMemory) may nest further LLM
+      // calls (the injection guard, embeds) under this same span.
+      const toolSpan = startChild(state.trace, tc.name, { input: tc.args }, "tool");
+      try {
+        const result = await tool.execute(tc, toolSpan);
+        endOk(toolSpan, { output: result?.content });
+        return result;
+      } catch (err) {
+        endError(toolSpan, err);
+        throw err;
+      }
     })
   );
   return { messages: responses, toolRounds: state.toolRounds + 1 };
@@ -231,18 +293,22 @@ function routeAfterCorvus(state) {
 // into working memory as an interaction anchor. Both steps log and swallow
 // their own errors, so this node never fails the run.
 async function extract(state) {
+  const span = startChild(state.trace, "extract", {});
   const reply = state.messages[state.messages.length - 1];
   const userMessage = state.messages.findLast((m) => m._getType() === "human");
-  const work = [extractMemories(state.messages)];
+  const work = [extractMemories(state.messages, state.subject, span)];
   if (userMessage && reply?._getType() === "ai" && chunkText(reply.content)) {
-    work.push(synthesizeInteraction(chunkText(userMessage.content), chunkText(reply.content)));
+    work.push(
+      synthesizeInteraction(chunkText(userMessage.content), chunkText(reply.content), span)
+    );
   }
   await Promise.all(work);
+  endOk(span, {});
 }
 
 // Only the corvus node calls the chat model for the reply; retrieve/extract
 // handle long-term memory around it, and tools executes any set_reminder/
-// web_search/search_memory calls. Every tool round loops back to corvus,
+// web_search/search_memory/save_memory calls. Every tool round loops back to corvus,
 // which decides whether to call again, up to MAX_TOOL_ROUNDS, or finalize
 // its reply.
 export const graph = new StateGraph(CorvusAnnotation)
@@ -267,8 +333,8 @@ export const graph = new StateGraph(CorvusAnnotation)
 // internal. Callers concatenate token text to reconstruct the full reply.
 // Once the final corvus node ends, the rest of the run (memory extraction)
 // is drained in the background so it never delays the response.
-export async function* streamCorvus(messages) {
-  const events = graph.streamEvents({ messages }, { version: "v2" });
+export async function* streamCorvus(messages, trace) {
+  const events = graph.streamEvents({ messages, trace }, { version: "v2" });
   const iterator = events[Symbol.asyncIterator]();
   let replyComplete = false;
   try {

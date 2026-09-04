@@ -2,6 +2,8 @@ import { z } from "zod";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import {
+  CORVUS_SUBJECT,
+  DEFAULT_SUBJECT,
   deleteMemory,
   getMemoriesByTag,
   saveMemory,
@@ -10,6 +12,7 @@ import {
   updateMemory,
 } from "./db.js";
 import { MEMORY_EXTRACTOR_PROMPT, formatMemoryTimestamp } from "./prompt.js";
+import { endError, endOk, startChild } from "./tracing.js";
 import { logger } from "./logger.js";
 
 const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL ?? "gemini-embedding-001";
@@ -19,27 +22,62 @@ const EMBEDDING_DIMENSIONS = 768;
 // LangChain's GoogleGenerativeAIEmbeddings doesn't expose
 // outputDimensionality (gemini-embedding-001 defaults to 3072 dims), so call
 // the embedContent REST API directly to get 768-dim vectors.
-export async function embed(text) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": process.env.GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        model: `models/${EMBEDDING_MODEL}`,
-        content: { parts: [{ text }] },
-        outputDimensionality: EMBEDDING_DIMENSIONS,
-      }),
-    }
+export async function embed(text, parent) {
+  const generation = startChild(
+    parent,
+    "gemini-embed",
+    { model: EMBEDDING_MODEL, input: text },
+    "embedding"
   );
-  if (!response.ok) {
-    throw new Error(`embedContent failed: ${response.status} ${await response.text()}`);
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          model: `models/${EMBEDDING_MODEL}`,
+          content: { parts: [{ text }] },
+          outputDimensionality: EMBEDDING_DIMENSIONS,
+        }),
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`embedContent failed: ${response.status} ${await response.text()}`);
+    }
+    const data = await response.json();
+    endOk(generation, { output: { dimensions: data.embedding.values.length } });
+    return data.embedding.values;
+  } catch (err) {
+    endError(generation, err);
+    throw err;
   }
-  const data = await response.json();
-  return data.embedding.values;
+}
+
+// subject is who/what a fact is about: the current speaker's name (see
+// memory_extractor's "Current speaker" line), another specific entity named
+// in the conversation (e.g. "Quentin"), or "" for a general fact tied to no
+// one in particular. Required (not nullable/optional): Gemini's structured
+// output tends to silently drop optional fields, and — worse — its
+// response_schema proto rejects the "type": ["string", "null"] that Zod's
+// .nullable() produces for this field (400 Bad Request: "Proto field is not
+// repeating, cannot start list"). Empty string is the required-field-safe
+// stand-in for null; normalizeSubject() below converts it back.
+const subjectField = z
+  .string()
+  .describe(
+    "who/what this fact is about: the current speaker's name, another named entity " +
+      `(e.g. a pet or another person), the literal "${CORVUS_SUBJECT}" for a stable fact ` +
+      'about Corvus itself, or "" for a general fact'
+  );
+
+// Maps the schema's "" sentinel (see subjectField above) back to null for
+// storage/lookup, which is what db.js's subject columns actually use.
+function normalizeSubject(subject) {
+  return subject ? subject : null;
 }
 
 // Three separate lists with all-required fields: Gemini's structured output
@@ -47,14 +85,15 @@ export async function embed(text) {
 // operations without their revised content.
 const extractionSchema = z.object({
   save: z
-    .array(z.object({ content: z.string().describe("the new memory text") }))
+    .array(z.object({ content: z.string().describe("the new memory text"), subject: subjectField }))
     .max(3)
-    .describe("new facts about the user to store"),
+    .describe("new facts to store"),
   update: z
     .array(
       z.object({
         id: z.number().describe("id of the existing memory to revise"),
         content: z.string().describe("the complete revised memory text"),
+        subject: subjectField,
       })
     )
     .max(3)
@@ -64,7 +103,7 @@ const extractionSchema = z.object({
     .max(3)
     .describe("existing memories that are contradicted or no longer true"),
   saveCore: z
-    .array(z.object({ content: z.string().describe("the new core memory text") }))
+    .array(z.object({ content: z.string().describe("the new core memory text"), subject: subjectField }))
     .max(2)
     .describe("new core profile facts to store"),
   updateCore: z
@@ -72,6 +111,7 @@ const extractionSchema = z.object({
       z.object({
         id: z.number().describe("id of the existing core memory to revise"),
         content: z.string().describe("the complete revised core memory text"),
+        subject: subjectField,
       })
     )
     .max(2)
@@ -91,9 +131,9 @@ const extractor = new ChatGoogleGenerativeAI({
 }).withStructuredOutput(extractionSchema);
 
 // Retrieval must never break chat: any failure degrades to no memories.
-export async function retrieveMemories(text) {
+export async function retrieveMemories(text, parent) {
   try {
-    const queryEmbedding = await embed(text);
+    const queryEmbedding = await embed(text, parent);
     return await searchMemories(queryEmbedding);
   } catch (err) {
     logger.error({ err }, "memory retrieval failed; continuing without memories");
@@ -102,10 +142,12 @@ export async function retrieveMemories(text) {
 }
 
 // Core memories are always injected into the system prompt, so this fetches
-// every active row rather than similarity-searching.
-export async function retrieveCoreMemories() {
+// every active row rather than similarity-searching. Scoped to `subject`
+// (the current speaker) plus subject-less general core facts — see
+// getMemoriesByTag.
+export async function retrieveCoreMemories(subject = DEFAULT_SUBJECT) {
   try {
-    return await getMemoriesByTag("core");
+    return await getMemoriesByTag("core", { subject });
   } catch (err) {
     logger.error({ err }, "core memory retrieval failed; continuing without them");
     return [];
@@ -114,9 +156,9 @@ export async function retrieveCoreMemories() {
 
 // Used by the search_memory tool to search past conversation messages.
 // Same never-throws contract as retrieveMemories.
-export async function retrievePastConversations(text) {
+export async function retrievePastConversations(text, parent) {
   try {
-    const queryEmbedding = await embed(text);
+    const queryEmbedding = await embed(text, parent);
     return await searchMessages(queryEmbedding);
   } catch (err) {
     logger.error({ err }, "past conversation retrieval failed; continuing without it");
@@ -131,12 +173,12 @@ async function applyOperations(
   relatedIds,
   coreIds
 ) {
-  for (const { content } of save) {
-    await saveMemory(content, await embed(content));
+  for (const { content, subject } of save) {
+    await saveMemory(content, await embed(content), null, normalizeSubject(subject));
   }
-  for (const { id, content } of update) {
+  for (const { id, content, subject } of update) {
     if (relatedIds.has(id)) {
-      await updateMemory(id, content, await embed(content));
+      await updateMemory(id, content, await embed(content), normalizeSubject(subject));
     } else {
       logger.warn({ id }, "skipping update for unknown memory id");
     }
@@ -148,12 +190,12 @@ async function applyOperations(
       logger.warn({ id }, "skipping delete for unknown memory id");
     }
   }
-  for (const { content } of saveCore) {
-    await saveMemory(content, await embed(content), "core");
+  for (const { content, subject } of saveCore) {
+    await saveMemory(content, await embed(content), "core", normalizeSubject(subject));
   }
-  for (const { id, content } of updateCore) {
+  for (const { id, content, subject } of updateCore) {
     if (coreIds.has(id)) {
-      await updateMemory(id, content, await embed(content));
+      await updateMemory(id, content, await embed(content), normalizeSubject(subject));
     } else {
       logger.warn({ id }, "skipping update for unknown core memory id");
     }
@@ -185,52 +227,67 @@ function formatTranscript(messages) {
     .join("\n");
 }
 
+// Renders an existing memory row for the extractor's prompt, including its
+// subject so the model can tell who/what each candidate for update/delete is
+// currently about.
+function formatExistingMemory(m) {
+  const subjectLabel = m.subject ? `subject: ${m.subject}` : "subject: none (general)";
+  return `- [id: ${m.id}] (${subjectLabel}) (last updated: ${formatMemoryTimestamp(m.updated_at)}) ${m.content}`;
+}
+
 // Runs after a reply completes with the full conversation. The extractor sees
 // the whole transcript for context, but the related-memory search stays keyed
 // on the latest exchange: that is where new facts appear, and embedding the
-// entire history would dilute the similarity match.
-export async function extractMemories(messages) {
+// entire history would dilute the similarity match. `subject` identifies who
+// is currently speaking with Corvus (see db.js's DEFAULT_SUBJECT/subjects),
+// so the extractor can label first-person facts with the right name instead
+// of a generic "the user".
+export async function extractMemories(messages, subject = DEFAULT_SUBJECT, parent) {
   const start = performance.now();
+  let generation;
   try {
     const reply = messages[messages.length - 1];
     const userMessage = messages.findLast((m) => m._getType() === "human");
     if (!userMessage || reply?._getType() !== "ai" || !messageText(reply)) return;
 
     const exchangeEmbedding = await embed(
-      `User: ${messageText(userMessage)}\nButler: ${messageText(reply)}`
+      `User: ${messageText(userMessage)}\nButler: ${messageText(reply)}`,
+      parent
     );
     const [related, coreMemories] = await Promise.all([
       searchMemories(exchangeEmbedding),
-      getMemoriesByTag("core"),
+      getMemoriesByTag("core", { subject }),
     ]);
     // bigserial ids come back from node-pg as strings; normalize to numbers.
     const relatedIds = new Set(related.map((m) => Number(m.id)));
     const coreIds = new Set(coreMemories.map((m) => Number(m.id)));
 
     const memoryList = related.length
-      ? related
-          .map(
-            (m) =>
-              `- [id: ${m.id}] (last updated: ${formatMemoryTimestamp(m.updated_at)}) ${m.content}`
-          )
-          .join("\n")
+      ? related.map(formatExistingMemory).join("\n")
       : "(none)";
 
     const coreList = coreMemories.length
-      ? coreMemories
-          .map(
-            (m) =>
-              `- [id: ${m.id}] (last updated: ${formatMemoryTimestamp(m.updated_at)}) ${m.content}`
-          )
-          .join("\n")
+      ? coreMemories.map(formatExistingMemory).join("\n")
       : "(none)";
 
+    const humanContent = `Current speaker: ${subject}\nReserved subject for facts about Corvus itself: ${CORVUS_SUBJECT}\n\nExisting core profile memories (for the current speaker, plus general and Corvus-subject ones):\n${coreList}\n\nExisting related memories (any subject):\n${memoryList}\n\nConversation:\n${formatTranscript(messages)}`;
+    generation = startChild(
+      parent,
+      "extract-memories",
+      {
+        model: process.env.GEMINI_MODEL,
+        input: [
+          { role: "system", content: MEMORY_EXTRACTOR_PROMPT },
+          { role: "user", content: humanContent },
+        ],
+      },
+      "generation"
+    );
     const operations = await extractor.invoke([
       new SystemMessage(MEMORY_EXTRACTOR_PROMPT),
-      new HumanMessage(
-        `Existing core profile memories:\n${coreList}\n\nExisting related memories:\n${memoryList}\n\nConversation:\n${formatTranscript(messages)}`
-      ),
+      new HumanMessage(humanContent),
     ]);
+    endOk(generation, { output: operations });
 
     await applyOperations(operations, relatedIds, coreIds);
     logger.info(
@@ -249,6 +306,7 @@ export async function extractMemories(messages) {
       "memory extraction completed"
     );
   } catch (err) {
+    if (generation) endError(generation, err);
     logger.error({ err }, "memory extraction failed");
   }
 }
